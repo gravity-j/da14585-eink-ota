@@ -215,7 +215,7 @@
       <span>1. 连接蓝牙设备</span>
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer;">
         <input type="checkbox" id="filterPrefix" checked />
-        <span>仅显示 NRF- / DLG- 开头设备</span>
+        <span>筛选 NRF- / DLG- 或 SUOTA 设备</span>
       </label>
     </h2>
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
@@ -246,7 +246,7 @@
       <div>
         <div class="fw-title">🕰️ 盒马原厂时钟固件 (V1.57 Factory)</div>
         <div class="fw-desc">
-          原厂 <code>5_hema_clock_down_low_V1.57</code> 提取的 SUOTA 镜像，随时可一键刷回原厂数字时钟界面。
+          从原厂 <code>5_hema_clock_down_low_V1.57</code> 提取的 SUOTA 镜像。设备仍能连接 SUOTA 时，可用它刷回原厂时钟固件。
         </div>
       </div>
     </label>
@@ -256,7 +256,7 @@
       <div style="width:100%;">
         <div class="fw-title">📂 上传自定义固件 (.bin / .img)</div>
         <div class="fw-desc" style="margin-bottom:6px;">
-          支持 <code>61,320B</code> SUOTA 升级包 (<code>70 51</code> 开头) 或 <code>262,144B</code> 完整 Flash 镜像 (自动提取 <code>0x2000</code> 分区并附加 XOR 校验)。
+          支持 <code>70 51</code> 开头的 SUOTA 升级包，或 <code>262,144B</code> 的完整 Flash 镜像（提取 <code>0x2000</code> 分区）。发送前会校验长度、CRC32 和 XOR。
         </div>
         <input type="file" id="customFile" accept=".bin,.img" />
       </div>
@@ -288,7 +288,7 @@
           <select id="selBank">
             <option value="0" selected>0 - 自动覆盖最旧分区 (Auto / Oldest，推荐)</option>
             <option value="1">1 - 强制写入 Bank 1 (0x02000)</option>
-            <option value="2">2 - 强制写入 Bank 2 (0x13000)</option>
+            <option value="2">2 - 强制写入 Bank 2 (0x14000)</option>
           </select>
         </div>
         <div>
@@ -310,6 +310,7 @@
     </div>
 
     <div style="margin-top:12px;">
+      <p class="fw-desc">自动选区会覆盖较旧的镜像。按原厂分区布局，首次刷机会覆盖 Bank 2 的备用固件。</p>
       <button id="btnStartOta" class="btn btn-success btn-full" disabled>🚀 开始一键 OTA 刷机</button>
     </div>
   </div>
@@ -373,12 +374,10 @@ const SUOTA_STATUS_TEXT = {
   0x16: 'EXT_MEM_READ_ERR (0x16 SPI Flash读取失败)'
 };
 
-let bleDevice = null;
-let gattServer = null;
-let suotaChars = {};
-let char1f1f = null;
-let statusWaiter = null;
+let connection = null;
+let isConnecting = false;
 let isOtaRunning = false;
+let isControlWriting = false;
 
 const logBox = document.getElementById('logBox');
 function log(msg, cls = '') {
@@ -394,55 +393,108 @@ document.getElementById('btnClearLog').onclick = () => { logBox.innerHTML = ''; 
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function waitForStatus(expectedCode, timeoutMs = 6000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      statusWaiter = null;
-      reject(new Error(`等待 SUOTA 状态通知 (期望 0x${expectedCode.toString(16)}) 超时 (${timeoutMs}ms)`));
-    }, timeoutMs);
-    statusWaiter = (code) => {
-      clearTimeout(timer);
-      statusWaiter = null;
-      resolve(code);
-    };
-  });
+function checkConnected(current) {
+  if (connection !== current || !current.device.gatt.connected) {
+    throw new Error('蓝牙设备已断开');
+  }
 }
 
-function onSuotaStatusNotify(event) {
+async function writeAndWaitForStatus(current, expected, timeoutMs, step, send) {
+  let finish;
+  let received = false;
+  let failure = null;
+  const status = new Promise(resolve => {
+    finish = error => {
+      if (received) return;
+      received = true;
+      failure = error;
+      resolve(error);
+    };
+  });
+  current.statusWaiter = {
+    notify(code) {
+      const desc = SUOTA_STATUS_TEXT[code] || `未知状态 0x${code.toString(16)}`;
+      finish(code === expected ? null : new Error(`${step}失败: ${desc}`));
+    },
+    finish
+  };
+
+  const check = () => {
+    if (failure) throw failure;
+    checkConnected(current);
+  };
+  let timer;
+  try {
+    check();
+    await send(check);
+    if (!received) {
+      timer = setTimeout(() => {
+        finish(new Error(`${step}超时: 未收到 SUOTA 状态 0x${expected.toString(16)}`));
+      }, timeoutMs);
+    }
+    const error = await status;
+    if (error) throw error;
+  } finally {
+    clearTimeout(timer);
+    current.statusWaiter = null;
+  }
+}
+
+function onSuotaStatusNotify(current, event) {
+  if (connection !== current) return;
   const val = event.target.value;
   if (!val || val.byteLength < 1) return;
   const code = val.getUint8(0);
-  const desc = SUOTA_STATUS_TEXT[code] || `未知状态 0x${code.toString(16)}`;
-  if (code === 0x02 || code === 0x10) {
-    // Normal progress status
-  } else {
+  if (code !== 0x02 && code !== 0x10 && code !== 0x03) {
+    const desc = SUOTA_STATUS_TEXT[code] || `未知状态 0x${code.toString(16)}`;
     log(`⚠️ SUOTA 状态通知: ${desc}`, 'log-warn');
   }
-  if (statusWaiter) {
-    statusWaiter(code);
+  current.statusWaiter?.notify(code);
+}
+
+function updateUi() {
+  const connected = !isConnecting && !!connection?.device.gatt.connected;
+  const busy = isConnecting || isOtaRunning || isControlWriting;
+  const badge = document.getElementById('connBadge');
+  badge.textContent = connected ? `已连接: ${connection.device.name || 'DA14585'}` : '未连接设备';
+  badge.className = connected ? 'badge connected' : 'badge';
+  document.getElementById('btnConnect').disabled = busy || connected;
+  document.getElementById('btnDisconnect').disabled = busy || !connected;
+  document.getElementById('btnStartOta').disabled = busy || !connected || !connection.suota;
+  for (const id of ['btnSendAuth', 'btnSyncTime', 'btnModeClock', 'btnFullRefresh', 'btnSendHex']) {
+    document.getElementById(id).disabled = busy || !connected || !connection.control;
+  }
+  for (const input of document.querySelectorAll('input[name="fwSource"], #customFile, #selBank, #selWriteMode')) {
+    input.disabled = isOtaRunning;
   }
 }
 
-function updateUiConnected(connected, name = '') {
-  const badge = document.getElementById('connBadge');
-  badge.textContent = connected ? `已连接: ${name}` : '未连接设备';
-  badge.className = connected ? 'badge connected' : 'badge';
-  document.getElementById('btnDisconnect').disabled = !connected;
-  document.getElementById('btnStartOta').disabled = !connected || !suotaChars.memDev || isOtaRunning;
-  const has1f1f = connected && !!char1f1f;
-  document.getElementById('btnSendAuth').disabled = !has1f1f;
-  document.getElementById('btnSyncTime').disabled = !has1f1f;
-  document.getElementById('btnModeClock').disabled = !has1f1f;
-  document.getElementById('btnFullRefresh').disabled = !has1f1f;
-  document.getElementById('btnSendHex').disabled = !has1f1f;
+function endConnection(current) {
+  if (connection !== current) return;
+  current.device.removeEventListener('gattserverdisconnected', current.onDisconnect);
+  if (current.suota) {
+    current.suota.status.removeEventListener('characteristicvaluechanged', current.suota.onStatus);
+  }
+  current.statusWaiter?.finish(new Error('蓝牙设备已断开'));
+  connection = null;
+  log('🔌 蓝牙已断开连接');
+  updateUi();
+}
+
+function disconnect(current) {
+  if (current.device.gatt.connected) current.device.gatt.disconnect();
+  endConnection(current);
 }
 
 document.getElementById('btnConnect').onclick = async () => {
+  if (isConnecting || connection || isOtaRunning || isControlWriting) return;
   if (!navigator.bluetooth) {
     log('❌ 当前浏览器不支持 Web Bluetooth！Mac/PC/Android 请用 Chrome 或 Edge；iPhone 请下载免费 Bluefy 浏览器打开。', 'log-err');
     alert('当前浏览器不支持 Web Bluetooth！\n\n• iPhone/iPad：请在 App Store 下载免费 "Bluefy" 浏览器打开本网址\n• 电脑/Android：请使用 Chrome 或 Edge 浏览器');
     return;
   }
+  isConnecting = true;
+  updateUi();
   try {
     const usePrefix = document.getElementById('filterPrefix').checked;
     const reqOpts = {
@@ -464,16 +516,20 @@ document.getElementById('btnConnect').onclick = async () => {
     }
 
     log('正在请求蓝牙设备扫描...');
-    bleDevice = await navigator.bluetooth.requestDevice(reqOpts);
-    bleDevice.addEventListener('gattserverdisconnected', () => {
-      log('🔌 蓝牙已断开连接 (若刚完成 OTA，设备正在重启进入新固件)', 'log-warn');
-      suotaChars = {};
-      char1f1f = null;
-      updateUiConnected(false);
-    });
-
-    log(`正在连接 ${bleDevice.name || bleDevice.id} ...`, 'log-info');
-    gattServer = await bleDevice.gatt.connect();
+    const device = await navigator.bluetooth.requestDevice(reqOpts);
+    log(`正在连接 ${device.name || device.id} ...`, 'log-info');
+    const gattServer = await device.gatt.connect();
+    const current = {
+      device,
+      suota: null,
+      control: null,
+      statusWaiter: null,
+      onDisconnect() {
+        if (!device.gatt.connected) endConnection(current);
+      }
+    };
+    connection = current;
+    device.addEventListener('gattserverdisconnected', current.onDisconnect);
     log(`✅ GATT 已连接！正在枚举服务...`, 'log-ok');
 
     // 1. Discover SUOTA 0xFEF5
@@ -484,14 +540,18 @@ document.getElementById('btnConnect').onclick = async () => {
       } catch (_) {
         svcSuota = await gattServer.getPrimaryService('0000fef5-0000-1000-8000-00805f9b34fb');
       }
-      suotaChars.memDev   = await svcSuota.getCharacteristic(UUID_SPOTA_MEM_DEV);
-      suotaChars.gpioMap  = await svcSuota.getCharacteristic(UUID_SPOTA_GPIO_MAP);
-      suotaChars.patchLen = await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_LEN);
-      suotaChars.patchData= await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_DATA);
-      suotaChars.status   = await svcSuota.getCharacteristic(UUID_SPOTA_STATUS);
-
-      await suotaChars.status.startNotifications();
-      suotaChars.status.addEventListener('characteristicvaluechanged', onSuotaStatusNotify);
+      const suota = {
+        memDev: await svcSuota.getCharacteristic(UUID_SPOTA_MEM_DEV),
+        gpioMap: await svcSuota.getCharacteristic(UUID_SPOTA_GPIO_MAP),
+        patchLen: await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_LEN),
+        patchData: await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_DATA),
+        status: await svcSuota.getCharacteristic(UUID_SPOTA_STATUS),
+        onStatus: event => onSuotaStatusNotify(current, event)
+      };
+      await suota.status.startNotifications();
+      checkConnected(current);
+      suota.status.addEventListener('characteristicvaluechanged', suota.onStatus);
+      current.suota = suota;
       log('✅ 已就绪: Dialog SUOTA 无线升级服务 (0xFEF5) & 状态通知已开启', 'log-ok');
     } catch (e) {
       log(`⚠️ 未能绑定完整 SUOTA (0xFEF5) 服务: ${e.message}`, 'log-warn');
@@ -506,26 +566,45 @@ document.getElementById('btnConnect').onclick = async () => {
         svc1f10 = await gattServer.getPrimaryService('00001f10-0000-1000-8000-00805f9b34fb');
       }
       try {
-        char1f1f = await svc1f10.getCharacteristic(UUID_CHAR_1F1F);
+        current.control = await svc1f10.getCharacteristic(UUID_CHAR_1F1F);
       } catch (_) {
-        char1f1f = await svc1f10.getCharacteristic('00001f1f-0000-1000-8000-00805f9b34fb');
+        current.control = await svc1f10.getCharacteristic('00001f1f-0000-1000-8000-00805f9b34fb');
       }
       log('✅ 已就绪: 墨水屏控制特征值 0x1F1F (Write me)', 'log-ok');
     } catch (e) {
       log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message})`, 'log-warn');
     }
 
-    updateUiConnected(true, bleDevice.name || 'DA14585');
+    if (!device.gatt.connected) endConnection(current);
   } catch (err) {
     log(`❌ 连接失败: ${err.message}`, 'log-err');
+  } finally {
+    isConnecting = false;
+    updateUi();
   }
 };
 
 document.getElementById('btnDisconnect').onclick = () => {
-  if (bleDevice && bleDevice.gatt.connected) {
-    bleDevice.gatt.disconnect();
-  }
+  if (!connection || isConnecting || isOtaRunning || isControlWriting) return;
+  disconnect(connection);
 };
+
+const FLASH_SIZE = 0x40000;
+const BANK1_START = 0x2000;
+const BANK2_START = 0x14000;
+const IMAGE_HEADER_SIZE = 64;
+
+function calculateCrc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      const polynomial = crc & 1 ? 0xedb88320 : 0;
+      crc = (crc >>> 1) ^ polynomial;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
 
 async function loadSelectedFirmware() {
   const src = document.querySelector('input[name="fwSource"]:checked').value;
@@ -541,96 +620,121 @@ async function loadSelectedFirmware() {
     if (!resp.ok) throw new Error('下载内置固件 fw_factory_v157_suota.bin 失败');
     rawBytes = new Uint8Array(await resp.arrayBuffer());
   } else {
-    const fileInput = document.getElementById('customFile');
-    if (!fileInput.files || !fileInput.files[0]) {
+    const file = document.getElementById('customFile').files?.[0];
+    if (!file) {
       throw new Error('请先选择要上传的 .bin / .img 固件文件');
     }
-    rawBytes = new Uint8Array(await fileInput.files[0].arrayBuffer());
+    if (file.size > FLASH_SIZE) {
+      throw new Error(`固件文件超过 ${FLASH_SIZE} Bytes`);
+    }
+    rawBytes = new Uint8Array(await file.arrayBuffer());
   }
 
-  // If 262,144-byte full SPI flash image (starts with 70 50 at 0x0000 and 70 51 at 0x2000), extract SUOTA bank at 0x2000
-  if (rawBytes.length === 262144 && rawBytes[0] === 0x70 && rawBytes[1] === 0x50 && rawBytes[0x2000] === 0x70 && rawBytes[0x2001] === 0x51) {
-    const dvFull = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
-    const codeSize = dvFull.getUint32(0x2004, true);
-    const suotaLen = 64 + codeSize;
-    log(`ℹ️ 检测到 256KB 完整编程器镜像，自动提取 0x2000 处的 SUOTA 升级包 (${suotaLen} Bytes)`, 'log-info');
-    rawBytes = rawBytes.slice(0x2000, 0x2000 + suotaLen);
+  const isFullFlash = rawBytes.length === FLASH_SIZE && rawBytes[0] === 0x70 && rawBytes[1] === 0x50;
+  if (isFullFlash) {
+    rawBytes = rawBytes.subarray(BANK1_START, BANK2_START);
   }
 
-  if (rawBytes.length < 64 || rawBytes[0] !== 0x70 || rawBytes[1] !== 0x51) {
-    throw new Error(`固件头签名不是 0x70 0x51 (实际为 0x${(rawBytes[0]||0).toString(16)} 0x${(rawBytes[1]||0).toString(16)})`);
+  if (rawBytes.length < IMAGE_HEADER_SIZE || rawBytes[0] !== 0x70 || rawBytes[1] !== 0x51) {
+    throw new Error('固件头不完整或缺少 0x70 0x51 签名');
   }
 
   const dv = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
   const codeSize = dv.getUint32(4, true);
-  const crc32 = dv.getUint32(8, true) >>> 0;
-  const expectedSuotaSize = 64 + codeSize;
-
-  // Compute XOR checksum over the 64-byte header + codeSize bytes
-  // Note: DA14585 spotar_patch_data_handler (0x07fcb498..0x07fcb578) XORs all received bytes into [0x07fd48f0+0x24]
-  // and expects expectedSuotaSize + 1 bytes total, where byte[expectedSuotaSize] is the XOR of bytes[0..expectedSuotaSize-1],
-  // so the final running XOR is 0x00 when 0xFE000000 is sent!
-  let xorCrc = 0;
-  for (let i = 0; i < expectedSuotaSize; i++) {
-    xorCrc ^= rawBytes[i];
+  const headerCrc = dv.getUint32(8, true);
+  const expectedSize = IMAGE_HEADER_SIZE + codeSize;
+  if (codeSize === 0 || expectedSize > BANK2_START - BANK1_START) {
+    throw new Error(`固件头声明的代码大小超出分区范围 (${codeSize} Bytes)`);
+  }
+  if (isFullFlash) {
+    rawBytes = rawBytes.subarray(0, expectedSize);
+    log(`ℹ️ 已从完整 Flash 镜像提取 0x2000 处的 SUOTA 镜像 (${expectedSize} Bytes)`, 'log-info');
+  }
+  if (rawBytes.length !== expectedSize && rawBytes.length !== expectedSize + 1) {
+    throw new Error(`固件长度 (${rawBytes.length}) 与头部声明长度 (${expectedSize}) 不匹配`);
   }
 
-  let finalPayload;
-  if (rawBytes.length === expectedSuotaSize) {
-    finalPayload = new Uint8Array(expectedSuotaSize + 1);
-    finalPayload.set(rawBytes, 0);
-    finalPayload[expectedSuotaSize] = xorCrc;
-  } else if (rawBytes.length === expectedSuotaSize + 1) {
-    finalPayload = rawBytes;
-  } else {
-    throw new Error(`固件长度 (${rawBytes.length}) 与 Header 声明长度 (${expectedSuotaSize}) 不匹配`);
+  const actualCrc = calculateCrc32(rawBytes.subarray(IMAGE_HEADER_SIZE, expectedSize));
+  if (actualCrc !== headerCrc) {
+    throw new Error(`固件 CRC32 不匹配，头部为 0x${headerCrc.toString(16)}，实际为 0x${actualCrc.toString(16)}`);
   }
 
-  log(`📦 固件就绪: Header=70 51, CodeSize=${codeSize}B, CRC32=0x${crc32.toString(16).padStart(8,'0')}, 附加尾字节 XOR=0x${xorCrc.toString(16).padStart(2,'0')} -> 总发送 ${finalPayload.length} Bytes`, 'log-info');
-  return finalPayload;
+  // SUOTA expects the XOR of the entire image and its trailing checksum byte to be zero.
+  let xor = 0;
+  for (const byte of rawBytes.subarray(0, expectedSize)) {
+    xor ^= byte;
+  }
+  if (rawBytes.length === expectedSize + 1 && rawBytes[expectedSize] !== xor) {
+    throw new Error('固件的 XOR 校验尾字节不正确');
+  }
+
+  const payload = new Uint8Array(expectedSize + 1);
+  payload.set(rawBytes);
+  payload[expectedSize] = xor;
+  log(`📦 固件校验通过: CodeSize=${codeSize}B, CRC32=0x${headerCrc.toString(16).padStart(8, '0')}, XOR=0x${xor.toString(16).padStart(2, '0')}，总发送 ${payload.length} Bytes`, 'log-info');
+  return payload;
 }
 
-async function writeCharacteristic(char, data, forceResponse = true) {
-  if (!forceResponse && char.writeValueWithoutResponse) {
-    await char.writeValueWithoutResponse(data);
-  } else if (char.writeValueWithResponse) {
-    await char.writeValueWithResponse(data);
-  } else {
-    await char.writeValue(data);
+function canWriteWithoutResponse(char) {
+  return char.properties?.writeWithoutResponse !== false && typeof char.writeValueWithoutResponse === 'function';
+}
+
+async function writeCharacteristic(char, data, withResponse = true) {
+  if (!withResponse && canWriteWithoutResponse(char)) {
+    return char.writeValueWithoutResponse(data);
   }
+  if (char.properties?.write !== false && typeof char.writeValueWithResponse === 'function') {
+    return char.writeValueWithResponse(data);
+  }
+  if (typeof char.writeValue === 'function' &&
+      (char.properties?.write !== false || (!withResponse && char.properties?.writeWithoutResponse !== false))) {
+    return char.writeValue(data);
+  }
+  throw new Error('蓝牙特征不支持所需的写入方式');
 }
 
 document.getElementById('btnStartOta').onclick = async () => {
-  if (isOtaRunning) return;
+  const current = connection;
+  if (isConnecting || isOtaRunning || isControlWriting || !current?.suota || !current.device.gatt.connected) return;
+  const {suota} = current;
+  const bank = parseInt(document.getElementById('selBank').value, 10);
+  const fastMode = document.getElementById('selWriteMode').value === 'withoutResponse';
+  const useWithResponse = !fastMode || !canWriteWithoutResponse(suota.patchData);
+  const progressBar = document.getElementById('progressBar');
+  const statStatus = document.getElementById('statStatus');
+  const statProgress = document.getElementById('statProgress');
+  let startRequested = false;
+
   isOtaRunning = true;
-  document.getElementById('btnStartOta').disabled = true;
+  updateUi();
+  progressBar.style.width = '0%';
+  statStatus.textContent = '正在加载并校验固件...';
+  statProgress.textContent = '0 / 0 B (0%)';
 
   try {
     const payload = await loadSelectedFirmware();
     const totalLen = payload.length;
-    const bank = parseInt(document.getElementById('selBank').value, 10) & 0x03;
-    const useWithResponse = document.getElementById('selWriteMode').value === 'withResponse';
-
-    const progressBar = document.getElementById('progressBar');
-    const statStatus = document.getElementById('statStatus');
-    const statProgress = document.getElementById('statProgress');
+    checkConnected(current);
+    statProgress.textContent = `0 / ${totalLen} B (0%)`;
+    if (fastMode && useWithResponse) {
+      log('⚠️ 当前连接不支持高速写入，改用带响应写入。', 'log-warn');
+    }
 
     // Step 1: Write SPOTA_MEM_DEV = 0x13000000 | bank (SPI Flash)
     const memDevCmd = new Uint8Array([bank, 0x00, 0x00, 0x13]);
     log(`1️⃣ 发送 SPOTA_MEM_DEV = 0x1300000${bank} (External SPI Flash, Bank=${bank})...`);
     statStatus.textContent = '正在初始化外部 SPI Flash...';
-    const pStart = waitForStatus(0x10, 4000).catch(() => null);
-    await writeCharacteristic(suotaChars.memDev, memDevCmd, true);
-    const st1 = await pStart;
-    if (st1 !== null && st1 !== 0x10) {
-      throw new Error(`SPOTA_MEM_DEV 返回错误状态: ${SUOTA_STATUS_TEXT[st1] || st1}`);
-    }
+    await writeAndWaitForStatus(current, 0x10, 4000, 'SUOTA 初始化', () => {
+      startRequested = true;
+      return writeCharacteristic(suota.memDev, memDevCmd);
+    });
     log('✅ 设备已进入 IMG_STARTED (0x10) 状态', 'log-ok');
 
     // Step 2: Write SPOTA_GPIO_MAP = 0x05060300 (MISO=P0_5, MOSI=P0_6, CS=P0_3, SCK=P0_0)
     const gpioMapCmd = new Uint8Array([0x00, 0x03, 0x06, 0x05]);
     log('2️⃣ 发送 SPOTA_GPIO_MAP = 0x05060300 (MISO=P0_5, MOSI=P0_6, CS=P0_3, SCK=P0_0)...');
-    await writeCharacteristic(suotaChars.gpioMap, gpioMapCmd, true);
+    checkConnected(current);
+    await writeCharacteristic(suota.gpioMap, gpioMapCmd);
 
     // Step 3: Stream blocks (BLOCK_SIZE = 240 bytes, CHUNK_SIZE = 20 bytes)
     const BLOCK_SIZE = 240;
@@ -646,31 +750,22 @@ document.getElementById('btnStartOta').onclick = async () => {
       const rem = totalLen - offset;
       const blockLen = Math.min(BLOCK_SIZE, rem);
 
-      // Update SPOTA_PATCH_LEN on first block or last remainder block
-      if (blockLen !== currentPatchLen) {
-        const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
-        await writeCharacteristic(suotaChars.patchLen, patchLenBytes, true);
-        currentPatchLen = blockLen;
-        log(`   设置 SPOTA_PATCH_LEN = ${blockLen} Bytes`);
-      }
-
-      // Prepare status promise BEFORE sending the last chunk of this block
-      const pBlockOk = waitForStatus(0x02, blockIdx === 0 ? 10000 : 6000);
-
-      for (let c = 0; c < blockLen; c += CHUNK_SIZE) {
-        const chunkLen = Math.min(CHUNK_SIZE, blockLen - c);
-        const chunk = payload.subarray(offset + c, offset + c + chunkLen);
-        await writeCharacteristic(suotaChars.patchData, chunk, useWithResponse);
-        if (!useWithResponse) {
-          await sleep(6);
+      await writeAndWaitForStatus(current, 0x02, blockIdx === 0 ? 10000 : 6000, `第 ${blockIdx + 1} 块写入`, async check => {
+        if (blockLen !== currentPatchLen) {
+          const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
+          await writeCharacteristic(suota.patchLen, patchLenBytes);
+          currentPatchLen = blockLen;
+          log(`   设置 SPOTA_PATCH_LEN = ${blockLen} Bytes`);
         }
-      }
 
-      // Wait for DA14585 to verify block & write to SPI Flash (returns 0x02 CMP_OK)
-      const stBlock = await pBlockOk;
-      if (stBlock !== 0x02) {
-        throw new Error(`第 ${blockIdx} 块写入失败: ${SUOTA_STATUS_TEXT[stBlock] || ('0x' + stBlock.toString(16))}`);
-      }
+        for (let c = 0; c < blockLen; c += CHUNK_SIZE) {
+          check();
+          const chunkEnd = Math.min(c + CHUNK_SIZE, blockLen);
+          const chunk = payload.subarray(offset + c, offset + chunkEnd);
+          await writeCharacteristic(suota.patchData, chunk, useWithResponse);
+          if (!useWithResponse) await sleep(6);
+        }
+      });
 
       offset += blockLen;
       blockIdx++;
@@ -690,42 +785,59 @@ document.getElementById('btnStartOta').onclick = async () => {
     // Step 4: Send SUOTA_IMG_END (0xFE000000) to verify full-image XOR == 0 and write 0xAA valid flag
     log('4️⃣ 发送结束校验指令 SPOTA_MEM_DEV = 0xFE000000...');
     statStatus.textContent = '正在校验整包 XOR 并激活新分区...';
-    const pEndOk = waitForStatus(0x02, 6000);
-    await writeCharacteristic(suotaChars.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFE]), true);
-    const stEnd = await pEndOk;
-    if (stEnd !== 0x02) {
-      throw new Error(`整包校验失败: ${SUOTA_STATUS_TEXT[stEnd] || ('0x' + stEnd.toString(16))}`);
-    }
+    await writeAndWaitForStatus(current, 0x02, 6000, '整包校验', () =>
+      writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFE]))
+    );
     log('🎉 整包 XOR 校验通过！SPI Flash 新分区已标记为 0xAA 有效！', 'log-ok');
 
     // Step 5: Send SUOTA_REBOOT (0xFD000000) to reboot into new firmware
-    log('5️⃣ 发送重启指令 SPOTA_MEM_DEV = 0xFD000000，墨水屏即将重启刷新！', 'log-ok');
-    statStatus.textContent = '✅ OTA 刷机成功！设备正在重启...';
+    statStatus.textContent = '固件已写入，正在请求设备重启...';
     try {
-      await writeCharacteristic(suotaChars.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]), false);
-    } catch (_) {
-      // Device resets immediately and drops BLE connection, which is expected
+      checkConnected(current);
+      await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]));
+      if (connection === current) disconnect(current);
+    } catch (err) {
+      statStatus.textContent = '固件已写入，重启未确认';
+      log(`⚠️ 重启指令未确认: ${err.message}。若屏幕未切换，可手动断电重上电。`, 'log-warn');
+      return;
     }
+    statStatus.textContent = '固件已写入，重启指令已确认';
+    log('✅ 重启指令已确认，请观察屏幕并重新连接以确认新固件已启动。', 'log-ok');
   } catch (err) {
     log(`❌ OTA 升级中断: ${err.message}`, 'log-err');
-    document.getElementById('statStatus').textContent = `❌ 失败: ${err.message}`;
+    statStatus.textContent = `❌ 失败: ${err.message}`;
+    if (startRequested && connection === current && current.device.gatt.connected) {
+      try {
+        await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]));
+      } catch (exitError) {
+        log(`⚠️ 无法发送 SUOTA 退出指令: ${exitError.message}`, 'log-warn');
+      }
+      // A fresh connection keeps delayed notifications from this transfer out of a retry.
+      if (connection === current) disconnect(current);
+    }
   } finally {
     isOtaRunning = false;
-    document.getElementById('btnStartOta').disabled = !(bleDevice && bleDevice.gatt.connected && suotaChars.memDev);
+    updateUi();
   }
 };
 
 // 3. 0x1F1F Quick Console Handlers
 async function send1f1f(bytes, desc) {
-  if (!char1f1f) return;
+  const current = connection;
+  if (isConnecting || isOtaRunning || isControlWriting || !current?.control || !current.device.gatt.connected) return;
+  isControlWriting = true;
+  updateUi();
   try {
     const arr = new Uint8Array(bytes);
     const hex = Array.from(arr).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
     log(`📤 [0x1F1F] ${desc}: ${hex}`, 'log-info');
-    await writeCharacteristic(char1f1f, arr, false);
+    await writeCharacteristic(current.control, arr, false);
     log(`✅ 已发送 (${arr.length} Bytes)`, 'log-ok');
   } catch (e) {
     log(`❌ 发送失败: ${e.message}`, 'log-err');
+  } finally {
+    isControlWriting = false;
+    updateUi();
   }
 }
 
@@ -734,14 +846,14 @@ document.getElementById('btnSendAuth').onclick = () => {
 };
 
 document.getElementById('btnSyncTime').onclick = () => {
-  // UTC+8 timestamp in 32-bit little-endian after 0xDD
+  // UTC+8 timestamp in 32-bit big-endian after 0xDD
   const nowUtc8 = Math.floor(Date.now() / 1000) + 8 * 3600;
   const cmd = [
     0xDD,
-    nowUtc8 & 0xff,
-    (nowUtc8 >>> 8) & 0xff,
+    (nowUtc8 >>> 24) & 0xff,
     (nowUtc8 >>> 16) & 0xff,
-    (nowUtc8 >>> 24) & 0xff
+    (nowUtc8 >>> 8) & 0xff,
+    nowUtc8 & 0xff
   ];
   send1f1f(cmd, `同步当前时间 (UTC+8=${nowUtc8})`);
 };
