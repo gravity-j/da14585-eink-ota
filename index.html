@@ -201,27 +201,31 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台</h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.4 Bluefy专版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
   <div class="notice">
-    💡 <b>使用环境</b>：电脑 (Mac/Windows) 或安卓手机请用 <b>Chrome / Edge</b> 打开；<b>iPhone / iPad</b> 请用 <b>Bluefy – Web BLE Browser</b> 打开。<br/>
-    ⚠️ <b>iPhone 搜不到或连不上？</b> 请先从手机后台<b>彻底上滑关闭 LightBlue</b>（墨水屏同一时间只能被一个 App 连接，LightBlue 在后台连着时 Bluefy 无法发现或连接设备）。
+    💡 <b>iPhone / iPad (Bluefy) 必看排查</b>：<br/>
+    1️⃣ 若点击下方扫描按钮<b>没有任何弹窗</b>：请打开 iPhone <b>「设置 ➔ 隐私与安全性 ➔ 蓝牙」</b>（或<b>「设置 ➔ Bluefy」</b>），确认已开启 <b>Bluefy 的蓝牙权限</b>，并在后台上滑重启一次 Bluefy。<br/>
+    2️⃣ 若弹窗里<b>搜不到 NRF-51D7</b>：请先从 iPhone 后台<b>彻底上滑关闭 LightBlue</b>（设备被 LightBlue 连着时不会广播）。
   </div>
 
   <!-- 1. 连接蓝牙 -->
   <div class="card">
     <h2>
-      <span>1. 连接蓝牙设备</span>
-      <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer;">
-        <input type="checkbox" id="filterPrefix" />
-        <span>仅过滤 NRF- / DLG- 名称前缀</span>
-      </label>
+      <span>1. 连接蓝牙设备 (三种扫描方式任选其一)</span>
+      <button id="btnDisconnect" class="btn btn-secondary" style="padding:5px 12px;font-size:0.8rem;" disabled>断开连接</button>
     </h2>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;">
-      <button id="btnConnect" class="btn" style="flex:1;">🔍 扫描并连接墨水屏 (如 NRF-51D7)</button>
-      <button id="btnDisconnect" class="btn btn-secondary" disabled>断开连接</button>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button id="btnConnectAll" class="btn btn-full">🔍 方式 A：扫描全部蓝牙设备 (推荐 iPhone Bluefy)</button>
+      <div class="grid-2">
+        <button id="btnConnectPrefix" class="btn btn-secondary">🎯 方式 B：按 NRF- 名称过滤</button>
+        <button id="btnConnectService" class="btn btn-secondary">📡 方式 C：按 0xFEF5 服务过滤</button>
+      </div>
+    </div>
+    <div id="connStatusInline" style="margin-top:10px;padding:8px 10px;border-radius:6px;background:#090d16;border:1px solid var(--border);font-size:0.82rem;color:#38bdf8;">
+      状态：等待点击上方按钮调用蓝牙扫描...
     </div>
   </div>
 
@@ -453,13 +457,31 @@ function onSuotaStatusNotify(current, event) {
   current.statusWaiter?.notify(code);
 }
 
+const connStatusInline = document.getElementById('connStatusInline');
+function setInlineStatus(msg, color = '#38bdf8') {
+  if (connStatusInline) {
+    connStatusInline.textContent = `状态：${msg}`;
+    connStatusInline.style.color = color;
+  }
+}
+
+window.addEventListener('error', (e) => {
+  setInlineStatus(`脚本错误: ${e.message}`, '#f87171');
+});
+window.addEventListener('unhandledrejection', (e) => {
+  setInlineStatus(`未捕获异常: ${e.reason?.message || e.reason}`, '#f87171');
+});
+
 function updateUi() {
   const connected = !isConnecting && !!connection?.device.gatt.connected;
   const busy = isConnecting || isOtaRunning || isControlWriting;
   const badge = document.getElementById('connBadge');
   badge.textContent = connected ? `已连接: ${connection.device.name || 'DA14585'}` : '未连接设备';
   badge.className = connected ? 'badge connected' : 'badge';
-  document.getElementById('btnConnect').disabled = busy || connected;
+  for (const id of ['btnConnectAll', 'btnConnectPrefix', 'btnConnectService']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy || connected;
+  }
   document.getElementById('btnDisconnect').disabled = busy || !connected;
   document.getElementById('btnStartOta').disabled = busy || !connected || !connection.suota;
   for (const id of ['btnSendAuth', 'btnSyncTime', 'btnModeClock', 'btnFullRefresh', 'btnSendHex']) {
@@ -479,6 +501,7 @@ function endConnection(current) {
   current.statusWaiter?.finish(new Error('蓝牙设备已断开'));
   connection = null;
   log('🔌 蓝牙已断开连接');
+  setInlineStatus('蓝牙已断开连接', '#fbbf24');
   updateUi();
 }
 
@@ -487,39 +510,16 @@ function disconnect(current) {
   endConnection(current);
 }
 
-async function requestBleDevice(usePrefix) {
-  const fullOptional = [
-    '0000fef5-0000-1000-8000-00805f9b34fb',
-    '00001f10-0000-1000-8000-00805f9b34fb',
-    '0000180a-0000-1000-8000-00805f9b34fb',
-    UUID_SVC_SUOTA,
-    UUID_SVC_CUSTOM,
-    0x180a
-  ];
-  const stringOnlyOptional = [
-    '0000fef5-0000-1000-8000-00805f9b34fb',
-    '00001f10-0000-1000-8000-00805f9b34fb',
-    '0000180a-0000-1000-8000-00805f9b34fb'
-  ];
-  const buildOpts = (optSvcs) => usePrefix
-    ? { filters: [{ namePrefix: 'NRF-' }, { namePrefix: 'DLG-' }], optionalServices: optSvcs }
-    : { acceptAllDevices: true, optionalServices: optSvcs };
-
-  try {
-    return await navigator.bluetooth.requestDevice(buildOpts(fullOptional));
-  } catch (err) {
-    if (err && (err.name === 'TypeError' || /optionalServices|UUID|filter/i.test(err.message || ''))) {
-      log(`ℹ️ 兼容模式重试扫描 (${err.message})...`, 'log-warn');
-      return await navigator.bluetooth.requestDevice(buildOpts(stringOnlyOptional));
-    }
-    throw err;
-  }
-}
+const PURE_OPTIONAL_SERVICES = [
+  '0000fef5-0000-1000-8000-00805f9b34fb',
+  '00001f10-0000-1000-8000-00805f9b34fb',
+  '0000180a-0000-1000-8000-00805f9b34fb'
+];
 
 async function findServiceCompatible(gattServer, allServices, shortHex, fullUuid, numUuid) {
   const found = allServices.find(s => String(s.uuid).toLowerCase().includes(shortHex));
   if (found) return found;
-  for (const candidate of [fullUuid, numUuid, shortHex, shortHex.toUpperCase()]) {
+  for (const candidate of [fullUuid, shortHex, shortHex.toUpperCase(), numUuid]) {
     try {
       return await gattServer.getPrimaryService(candidate);
     } catch (_) {}
@@ -531,7 +531,7 @@ async function findCharCompatible(service, allChars, fullUuid, matchKey, numUuid
   const found = allChars.find(c => String(c.uuid).toLowerCase().includes(matchKey));
   if (found) return found;
   const candidates = [fullUuid, fullUuid.toUpperCase()];
-  if (numUuid !== null) candidates.push(numUuid, matchKey, matchKey.toUpperCase());
+  if (numUuid !== null) candidates.push(matchKey, matchKey.toUpperCase(), numUuid);
   for (const candidate of candidates) {
     try {
       return await service.getCharacteristic(candidate);
@@ -540,20 +540,36 @@ async function findCharCompatible(service, allChars, fullUuid, matchKey, numUuid
   throw new Error(`未找到特征 ${matchKey}`);
 }
 
-document.getElementById('btnConnect').onclick = async () => {
+async function startBleScanAndConnect(reqOpts, modeDesc) {
   if (isConnecting || connection || isOtaRunning || isControlWriting) return;
-  if (!navigator.bluetooth) {
-    log('❌ 当前浏览器不支持 Web Bluetooth！Mac/PC/Android 请用 Chrome 或 Edge；iPhone 请下载免费 Bluefy 浏览器打开。', 'log-err');
-    alert('当前浏览器不支持 Web Bluetooth！\n\n• iPhone/iPad：请在 App Store 下载免费 "Bluefy" 浏览器打开本网址\n• 电脑/Android：请使用 Chrome 或 Edge 浏览器');
+  if (!navigator.bluetooth || typeof navigator.bluetooth.requestDevice !== 'function') {
+    const msg = '当前浏览器不支持 Web Bluetooth！iPhone 请使用 Bluefy 打开，电脑/安卓请用 Chrome/Edge。';
+    setInlineStatus(msg, '#f87171');
+    log(`❌ ${msg}`, 'log-err');
+    alert(msg);
     return;
   }
+
+  // Call requestDevice IMMEDIATELY inside the user click gesture with pure string UUIDs
+  setInlineStatus(`已触发「${modeDesc}」，正在等待浏览器弹出蓝牙列表... (若无反应请检查 iOS 设置->Bluefy->蓝牙权限)`, '#fbbf24');
+  log(`🔍 [${modeDesc}] 正在调用 navigator.bluetooth.requestDevice...`);
+
+  let device;
+  try {
+    device = await navigator.bluetooth.requestDevice(reqOpts);
+  } catch (err) {
+    const errMsg = err?.message || String(err);
+    setInlineStatus(`扫描取消或失败: ${errMsg}`, '#f87171');
+    log(`❌ 扫描未完成: ${errMsg}`, 'log-err');
+    return;
+  }
+
   isConnecting = true;
   updateUi();
   try {
-    const usePrefix = document.getElementById('filterPrefix').checked;
-    log(`正在请求蓝牙设备扫描 (${usePrefix ? '按 NRF-/DLG- 名称过滤' : '显示全部蓝牙设备，适配 iOS Bluefy'})...`);
-    const device = await requestBleDevice(usePrefix);
-    log(`正在连接 ${device.name || device.id || '蓝牙设备'} ...`, 'log-info');
+    const devName = device.name || device.id || '蓝牙设备';
+    setInlineStatus(`已选择 ${devName}，正在建立 GATT 连接...`, '#38bdf8');
+    log(`正在连接 ${devName} ...`, 'log-info');
     const gattServer = await device.gatt.connect();
     const current = {
       device,
@@ -566,6 +582,7 @@ document.getElementById('btnConnect').onclick = async () => {
     };
     connection = current;
     device.addEventListener('gattserverdisconnected', current.onDisconnect);
+    setInlineStatus(`已连接 ${devName}，正在读取服务与特征...`, '#38bdf8');
     log(`✅ GATT 已连接！正在枚举服务...`, 'log-ok');
 
     // Enumerate all primary services first (works reliably in iOS Bluefy & Android Chrome)
@@ -632,13 +649,39 @@ document.getElementById('btnConnect').onclick = async () => {
       log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message || e})`, 'log-warn');
     }
 
-    if (!device.gatt.connected) endConnection(current);
+    if (!device.gatt.connected) {
+      endConnection(current);
+    } else {
+      setInlineStatus(`✅ 已连接 ${devName} (SUOTA: ${current.suota ? '就绪' : '无'}, 0x1F1F: ${current.control ? '就绪' : '无'})`, '#4ade80');
+    }
   } catch (err) {
+    setInlineStatus(`连接失败: ${err.message || err}`, '#f87171');
     log(`❌ 连接失败: ${err.message || err}`, 'log-err');
   } finally {
     isConnecting = false;
     updateUi();
   }
+}
+
+document.getElementById('btnConnectAll').onclick = () => {
+  startBleScanAndConnect({
+    acceptAllDevices: true,
+    optionalServices: PURE_OPTIONAL_SERVICES
+  }, '方式A: 全部设备');
+};
+
+document.getElementById('btnConnectPrefix').onclick = () => {
+  startBleScanAndConnect({
+    filters: [{ namePrefix: 'NRF-' }, { namePrefix: 'DLG-' }],
+    optionalServices: PURE_OPTIONAL_SERVICES
+  }, '方式B: NRF-前缀');
+};
+
+document.getElementById('btnConnectService').onclick = () => {
+  startBleScanAndConnect({
+    filters: [{ services: ['0000fef5-0000-1000-8000-00805f9b34fb'] }],
+    optionalServices: PURE_OPTIONAL_SERVICES
+  }, '方式C: 0xFEF5服务');
 };
 
 document.getElementById('btnDisconnect').onclick = () => {
