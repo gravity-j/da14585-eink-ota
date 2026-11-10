@@ -201,7 +201,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.4 Bluefy专版</span></h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.5 Bluefy专版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
@@ -779,24 +779,42 @@ function canWriteWithoutResponse(char) {
   return char.properties?.writeWithoutResponse === true && typeof char.writeValueWithoutResponse === 'function';
 }
 
+function formatErr(err) {
+  if (!err) return '未知错误 (连接中断或超时)';
+  if (typeof err === 'string') return err;
+  if (err.message) return err.message;
+  try { return JSON.stringify(err); } catch (_) { return String(err); }
+}
+
+function toStandaloneBuffer(data) {
+  if (data instanceof Uint8Array) {
+    if (data.byteOffset === 0 && data.buffer.byteLength === data.byteLength) {
+      return data;
+    }
+    return data.slice(0, data.byteLength);
+  }
+  return new Uint8Array(data);
+}
+
 async function writeCharacteristic(char, data, withResponse = true) {
+  const buf = toStandaloneBuffer(data);
   if (!withResponse && typeof char.writeValueWithoutResponse === 'function') {
     try {
-      return await char.writeValueWithoutResponse(data);
+      return await char.writeValueWithoutResponse(buf);
     } catch (_) {}
   }
   if (withResponse && typeof char.writeValueWithResponse === 'function') {
     try {
-      return await char.writeValueWithResponse(data);
+      return await char.writeValueWithResponse(buf);
     } catch (err) {
       if (typeof char.writeValue !== 'function') throw err;
     }
   }
   if (typeof char.writeValue === 'function') {
-    return await char.writeValue(data);
+    return await char.writeValue(buf);
   }
   if (typeof char.writeValueWithResponse === 'function') {
-    return await char.writeValueWithResponse(data);
+    return await char.writeValueWithResponse(buf);
   }
   throw new Error('蓝牙特征不支持写入操作');
 }
@@ -850,6 +868,7 @@ document.getElementById('btnStartOta').onclick = async () => {
     let offset = 0;
     let currentPatchLen = 0;
     let blockIdx = 0;
+    let bluefyNoAckMode = false;
     const startTime = performance.now();
 
     log(`3️⃣ 开始分块传输 (每块 ${BLOCK_SIZE}B，每包 ${CHUNK_SIZE}B，共 ${Math.ceil(totalLen / BLOCK_SIZE)} 块)...`, 'log-info');
@@ -858,7 +877,7 @@ document.getElementById('btnStartOta').onclick = async () => {
       const rem = totalLen - offset;
       const blockLen = Math.min(BLOCK_SIZE, rem);
 
-      await writeAndWaitForStatus(current, 0x02, blockIdx === 0 ? 10000 : 6000, `第 ${blockIdx + 1} 块写入`, async check => {
+      await writeAndWaitForStatus(current, 0x02, blockIdx === 0 ? 12000 : 8000, `第 ${blockIdx + 1} 块写入`, async check => {
         if (blockLen !== currentPatchLen) {
           const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
           await writeCharacteristic(suota.patchLen, patchLenBytes);
@@ -869,9 +888,28 @@ document.getElementById('btnStartOta').onclick = async () => {
         for (let c = 0; c < blockLen; c += CHUNK_SIZE) {
           check();
           const chunkEnd = Math.min(c + CHUNK_SIZE, blockLen);
-          const chunk = payload.subarray(offset + c, offset + chunkEnd);
-          await writeCharacteristic(suota.patchData, chunk, useWithResponse);
-          if (!useWithResponse) await sleep(6);
+          // MUST use .slice() (standalone 20B ArrayBuffer), NOT .subarray() (which shares the 61,321B buffer in Bluefy!)
+          const chunk = payload.slice(offset + c, offset + chunkEnd);
+
+          if (bluefyNoAckMode) {
+            writeCharacteristic(suota.patchData, chunk, false).catch(() => {});
+            await sleep(16);
+          } else if (blockIdx === 0 && c === 0) {
+            // Probe on the very first chunk: if Bluefy uses CoreBluetooth .withoutResponse on SPOTA_PATCH_DATA,
+            // didWriteValueFor is never called by iOS so the Promise never resolves.
+            let resolvedInTime = false;
+            const pWrite = writeCharacteristic(suota.patchData, chunk, useWithResponse).then(() => {
+              resolvedInTime = true;
+            });
+            await Promise.race([pWrite, sleep(250)]);
+            if (!resolvedInTime) {
+              bluefyNoAckMode = true;
+              log('ℹ️ 检测到 iOS Bluefy 无回调写入特征 (WriteWithoutResponse)，自动启用 16ms 节流 + 块级 0x02 硬件确认模式', 'log-info');
+            }
+          } else {
+            await writeCharacteristic(suota.patchData, chunk, useWithResponse);
+            if (!useWithResponse) await sleep(6);
+          }
         }
       });
 
@@ -906,19 +944,20 @@ document.getElementById('btnStartOta').onclick = async () => {
       if (connection === current) disconnect(current);
     } catch (err) {
       statStatus.textContent = '固件已写入，重启未确认';
-      log(`⚠️ 重启指令未确认: ${err.message}。若屏幕未切换，可手动断电重上电。`, 'log-warn');
+      log(`⚠️ 重启指令未确认: ${formatErr(err)}。若屏幕未切换，可手动断电重上电。`, 'log-warn');
       return;
     }
     statStatus.textContent = '固件已写入，重启指令已确认';
     log('✅ 重启指令已确认，请观察屏幕并重新连接以确认新固件已启动。', 'log-ok');
   } catch (err) {
-    log(`❌ OTA 升级中断: ${err.message}`, 'log-err');
-    statStatus.textContent = `❌ 失败: ${err.message}`;
+    const errMsg = formatErr(err);
+    log(`❌ OTA 升级中断: ${errMsg}`, 'log-err');
+    statStatus.textContent = `❌ 失败: ${errMsg}`;
     if (startRequested && connection === current && current.device.gatt.connected) {
       try {
         await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]));
       } catch (exitError) {
-        log(`⚠️ 无法发送 SUOTA 退出指令: ${exitError.message}`, 'log-warn');
+        log(`⚠️ 无法发送 SUOTA 退出指令: ${formatErr(exitError)}`, 'log-warn');
       }
       // A fresh connection keeps delayed notifications from this transfer out of a retry.
       if (connection === current) disconnect(current);
