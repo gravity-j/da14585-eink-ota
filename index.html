@@ -201,7 +201,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.6 Bluefy专版</span></h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.7 Bluefy专版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
@@ -239,9 +239,9 @@
     <label class="fw-option">
       <input type="radio" name="fwSource" value="diag_5s" checked />
       <div>
-        <div class="fw-title">🚀 硬件诊断 + 5秒单次局刷固件 (V1.57-Diag-5s v1.6，推荐)</div>
+        <div class="fw-title">🚀 硬件诊断 + 5秒单次局刷固件 (V1.57-Diag-5s v1.7，推荐)</div>
         <div class="fw-desc">
-          已修复原厂每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>render_screen_main</code> 重复复位问题；严格每 <b>5.0 秒</b>单次局刷 (~0.9s 刷新 + ~4.1s 静止休眠)，支持 <code>HW=1 (SSD1680)</code> 温度读取与 <code>0x1F1F</code> 指令回显。<code>CRC32: 0x6bb217b1</code>
+          已修复原厂每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>render_screen_main</code> 重复复位问题；严格每 <b>5.0 秒</b>单次局刷 (~0.9s 刷新 + ~4.1s 静止休眠)，支持 <code>HW=1 (SSD1680)</code> 温度读取与 <code>0x1F1F</code> 指令回显。<code>CRC32: 0x88fb82a2</code>
         </div>
       </div>
     </label>
@@ -314,9 +314,10 @@
       <span id="statProgress">0 / 0 B (0%)</span>
     </div>
 
-    <div style="margin-top:12px;">
-      <p class="fw-desc">自动选区会覆盖较旧的镜像。按原厂分区布局，首次刷机会覆盖 Bank 2 的备用固件。</p>
-      <button id="btnStartOta" class="btn btn-success btn-full" disabled>🚀 开始一键 OTA 刷机</button>
+    <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px;">
+      <p class="fw-desc">⚠️ <b>为什么刚才刷不回去？</b>因为 <code>HW=1</code> 主板上墨水屏与 SPI Flash 共用 <code>P0_0/P0_5/P0_6</code> 引脚，屏幕狂刷时会抢占引脚导致刷机中断。点击下方「开始一键 OTA 刷机」时会自动先发送 <code>0x80</code> 暂停屏幕刷新并释放 SPI 引脚（也可先手动点暂停按钮）：</p>
+      <button id="btnPauseRefresh" class="btn btn-secondary btn-full" disabled>⏸️ 暂停墨水屏刷新 (锁定 SPI 引脚以便刷机)</button>
+      <button id="btnStartOta" class="btn btn-success btn-full" disabled>🚀 开始一键 OTA 刷机 (自动先暂停刷屏)</button>
     </div>
   </div>
 
@@ -483,6 +484,7 @@ function updateUi() {
     if (el) el.disabled = busy || connected;
   }
   document.getElementById('btnDisconnect').disabled = busy || !connected;
+  document.getElementById('btnPauseRefresh').disabled = busy || !connected || (!connection.imgCtrl && !connection.control);
   document.getElementById('btnStartOta').disabled = busy || !connected || !connection.suota;
   for (const id of ['btnSendAuth', 'btnSyncTime', 'btnModeClock', 'btnFullRefresh', 'btnSendHex']) {
     document.getElementById(id).disabled = busy || !connected || !connection.control;
@@ -513,7 +515,9 @@ function disconnect(current) {
 const PURE_OPTIONAL_SERVICES = [
   '0000fef5-0000-1000-8000-00805f9b34fb',
   '00001f10-0000-1000-8000-00805f9b34fb',
-  '0000180a-0000-1000-8000-00805f9b34fb'
+  '0000180a-0000-1000-8000-00805f9b34fb',
+  '13187b10-eba9-a3ba-044e-83d3217d9a38',
+  '217d9a38-83d3-044e-baa3-a9eb107b1813'
 ];
 
 async function findServiceCompatible(gattServer, allServices, shortHex, fullUuid, numUuid) {
@@ -575,6 +579,8 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
       device,
       suota: null,
       control: null,
+      imgCtrl: null,
+      epdLocked: false,
       statusWaiter: null,
       onDisconnect() {
         if (!device.gatt.connected) endConnection(current);
@@ -647,6 +653,30 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
       log('✅ 已就绪: 墨水屏控制特征值 0x1F1F (Write me)', 'log-ok');
     } catch (e) {
       log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message || e})`, 'log-warn');
+    }
+
+    // 3. Discover Image Transfer Service 13187b10... -> 4b646063... (used for 0x80 screen refresh lock)
+    try {
+      let svcImg = allServices.find(s => {
+        const u = String(s.uuid).toLowerCase();
+        return u.includes('13187b10') || u.includes('217d9a38');
+      });
+      if (!svcImg) {
+        try { svcImg = await gattServer.getPrimaryService('13187b10-eba9-a3ba-044e-83d3217d9a38'); } catch (_) {}
+      }
+      if (svcImg) {
+        let imgChars = [];
+        try { imgChars = await svcImg.getCharacteristics(); } catch (_) {}
+        current.imgCtrl = await findCharCompatible(
+          svcImg,
+          imgChars,
+          '4b646063-6264-f3a7-8941-e65356ea82fe',
+          '4b646063'
+        );
+        log('✅ 已就绪: 刷屏锁特征值 4b646063 (支持发送 0x80 暂停墨水屏刷新)', 'log-ok');
+      }
+    } catch (e) {
+      log(`ℹ️ 未发现 4b646063 刷屏锁特征 (${e.message || e})`, 'log-warn');
     }
 
     if (!device.gatt.connected) {
@@ -819,6 +849,53 @@ async function writeCharacteristic(char, data, withResponse = true) {
   throw new Error('蓝牙特征不支持写入操作');
 }
 
+async function lockEpdRefreshBeforeOta(current, statStatus = null) {
+  if (!current.imgCtrl && !current.control) return;
+  const cmd80 = new Uint8Array([0x80]);
+  if (current.epdLocked) {
+    if (current.imgCtrl) {
+      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(200)]);
+    }
+    return;
+  }
+  log('⏸️ 正在向设备持续发送 0x80 刷屏暂停锁 (约 5 秒，等待当前局刷周期结束并锁定 SPI 引脚 P0_0/P0_5/P0_6)...', 'log-info');
+  const totalSteps = 26;
+  for (let i = 0; i < totalSteps; i++) {
+    checkConnected(current);
+    const remSec = (((totalSteps - i) * 0.19)).toFixed(1);
+    if (statStatus) {
+      statStatus.textContent = `⏸️ 正在锁定墨水屏刷新以释放 SPI 引脚 (剩余 ${remSec}s)...`;
+    }
+    if (current.imgCtrl) {
+      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(180)]);
+    } else if (current.control) {
+      await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(180)]);
+    }
+    await sleep(160);
+  }
+  current.epdLocked = true;
+  log('✅ 墨水屏刷新已暂停并锁定 (*0x07fcef74 = 1)，SPI Flash 引脚已释放！', 'log-ok');
+  if (statStatus) {
+    statStatus.textContent = '✅ 墨水屏已暂停，准备刷机';
+  }
+}
+
+document.getElementById('btnPauseRefresh').onclick = async () => {
+  const current = connection;
+  if (isConnecting || isOtaRunning || isControlWriting || !current || !current.device.gatt.connected) return;
+  isControlWriting = true;
+  updateUi();
+  try {
+    current.epdLocked = false;
+    await lockEpdRefreshBeforeOta(current, document.getElementById('statStatus'));
+  } catch (err) {
+    log(`⚠️ 暂停刷屏指令异常: ${formatErr(err)}`, 'log-warn');
+  } finally {
+    isControlWriting = false;
+    updateUi();
+  }
+};
+
 document.getElementById('btnStartOta').onclick = async () => {
   const current = connection;
   if (isConnecting || isOtaRunning || isControlWriting || !current?.suota || !current.device.gatt.connected) return;
@@ -845,6 +922,9 @@ document.getElementById('btnStartOta').onclick = async () => {
     if (fastMode && useWithResponse) {
       log('⚠️ 当前连接不支持高速写入，改用带响应写入。', 'log-warn');
     }
+
+    // Step 0: Lock E-Ink refresh so the display never hijacks P0_0/P0_5/P0_6 during SPI Flash writes
+    await lockEpdRefreshBeforeOta(current, statStatus);
 
     // Step 1: Write SPOTA_MEM_DEV = 0x13000000 | bank (SPI Flash)
     const memDevCmd = new Uint8Array([bank, 0x00, 0x00, 0x13]);
