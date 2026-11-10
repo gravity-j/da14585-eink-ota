@@ -206,7 +206,8 @@
   </header>
 
   <div class="notice">
-    💡 <b>使用环境</b>：电脑 (Mac/Windows) 或安卓手机请用 <b>Chrome / Edge</b> 打开；<b>iPhone / iPad</b> 请在 App Store 免费下载 <b>Bluefy – Web BLE Browser</b> 并粘贴本页网址打开。
+    💡 <b>使用环境</b>：电脑 (Mac/Windows) 或安卓手机请用 <b>Chrome / Edge</b> 打开；<b>iPhone / iPad</b> 请用 <b>Bluefy – Web BLE Browser</b> 打开。<br/>
+    ⚠️ <b>iPhone 搜不到或连不上？</b> 请先从手机后台<b>彻底上滑关闭 LightBlue</b>（墨水屏同一时间只能被一个 App 连接，LightBlue 在后台连着时 Bluefy 无法发现或连接设备）。
   </div>
 
   <!-- 1. 连接蓝牙 -->
@@ -214,8 +215,8 @@
     <h2>
       <span>1. 连接蓝牙设备</span>
       <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer;">
-        <input type="checkbox" id="filterPrefix" checked />
-        <span>筛选 NRF- / DLG- 或 SUOTA 设备</span>
+        <input type="checkbox" id="filterPrefix" />
+        <span>仅过滤 NRF- / DLG- 名称前缀</span>
       </label>
     </h2>
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
@@ -486,6 +487,59 @@ function disconnect(current) {
   endConnection(current);
 }
 
+async function requestBleDevice(usePrefix) {
+  const fullOptional = [
+    '0000fef5-0000-1000-8000-00805f9b34fb',
+    '00001f10-0000-1000-8000-00805f9b34fb',
+    '0000180a-0000-1000-8000-00805f9b34fb',
+    UUID_SVC_SUOTA,
+    UUID_SVC_CUSTOM,
+    0x180a
+  ];
+  const stringOnlyOptional = [
+    '0000fef5-0000-1000-8000-00805f9b34fb',
+    '00001f10-0000-1000-8000-00805f9b34fb',
+    '0000180a-0000-1000-8000-00805f9b34fb'
+  ];
+  const buildOpts = (optSvcs) => usePrefix
+    ? { filters: [{ namePrefix: 'NRF-' }, { namePrefix: 'DLG-' }], optionalServices: optSvcs }
+    : { acceptAllDevices: true, optionalServices: optSvcs };
+
+  try {
+    return await navigator.bluetooth.requestDevice(buildOpts(fullOptional));
+  } catch (err) {
+    if (err && (err.name === 'TypeError' || /optionalServices|UUID|filter/i.test(err.message || ''))) {
+      log(`ℹ️ 兼容模式重试扫描 (${err.message})...`, 'log-warn');
+      return await navigator.bluetooth.requestDevice(buildOpts(stringOnlyOptional));
+    }
+    throw err;
+  }
+}
+
+async function findServiceCompatible(gattServer, allServices, shortHex, fullUuid, numUuid) {
+  const found = allServices.find(s => String(s.uuid).toLowerCase().includes(shortHex));
+  if (found) return found;
+  for (const candidate of [fullUuid, numUuid, shortHex, shortHex.toUpperCase()]) {
+    try {
+      return await gattServer.getPrimaryService(candidate);
+    } catch (_) {}
+  }
+  throw new Error(`未找到服务 0x${shortHex.toUpperCase()}`);
+}
+
+async function findCharCompatible(service, allChars, fullUuid, matchKey, numUuid = null) {
+  const found = allChars.find(c => String(c.uuid).toLowerCase().includes(matchKey));
+  if (found) return found;
+  const candidates = [fullUuid, fullUuid.toUpperCase()];
+  if (numUuid !== null) candidates.push(numUuid, matchKey, matchKey.toUpperCase());
+  for (const candidate of candidates) {
+    try {
+      return await service.getCharacteristic(candidate);
+    } catch (_) {}
+  }
+  throw new Error(`未找到特征 ${matchKey}`);
+}
+
 document.getElementById('btnConnect').onclick = async () => {
   if (isConnecting || connection || isOtaRunning || isControlWriting) return;
   if (!navigator.bluetooth) {
@@ -497,27 +551,9 @@ document.getElementById('btnConnect').onclick = async () => {
   updateUi();
   try {
     const usePrefix = document.getElementById('filterPrefix').checked;
-    const reqOpts = {
-      optionalServices: [
-        UUID_SVC_SUOTA,
-        '0000fef5-0000-1000-8000-00805f9b34fb',
-        UUID_SVC_CUSTOM,
-        '00001f10-0000-1000-8000-00805f9b34fb'
-      ]
-    };
-    if (usePrefix) {
-      reqOpts.filters = [
-        { namePrefix: 'NRF-' },
-        { namePrefix: 'DLG-' },
-        { services: [UUID_SVC_SUOTA] }
-      ];
-    } else {
-      reqOpts.acceptAllDevices = true;
-    }
-
-    log('正在请求蓝牙设备扫描...');
-    const device = await navigator.bluetooth.requestDevice(reqOpts);
-    log(`正在连接 ${device.name || device.id} ...`, 'log-info');
+    log(`正在请求蓝牙设备扫描 (${usePrefix ? '按 NRF-/DLG- 名称过滤' : '显示全部蓝牙设备，适配 iOS Bluefy'})...`);
+    const device = await requestBleDevice(usePrefix);
+    log(`正在连接 ${device.name || device.id || '蓝牙设备'} ...`, 'log-info');
     const gattServer = await device.gatt.connect();
     const current = {
       device,
@@ -532,20 +568,33 @@ document.getElementById('btnConnect').onclick = async () => {
     device.addEventListener('gattserverdisconnected', current.onDisconnect);
     log(`✅ GATT 已连接！正在枚举服务...`, 'log-ok');
 
+    // Enumerate all primary services first (works reliably in iOS Bluefy & Android Chrome)
+    let allServices = [];
+    try {
+      allServices = await gattServer.getPrimaryServices();
+      log(`ℹ️ 已发现 ${allServices.length} 个服务: ${allServices.map(s => s.uuid).join(', ')}`);
+    } catch (_) {}
+
     // 1. Discover SUOTA 0xFEF5
     try {
-      let svcSuota;
+      const svcSuota = await findServiceCompatible(
+        gattServer,
+        allServices,
+        'fef5',
+        '0000fef5-0000-1000-8000-00805f9b34fb',
+        UUID_SVC_SUOTA
+      );
+      let suotaCharsList = [];
       try {
-        svcSuota = await gattServer.getPrimaryService(UUID_SVC_SUOTA);
-      } catch (_) {
-        svcSuota = await gattServer.getPrimaryService('0000fef5-0000-1000-8000-00805f9b34fb');
-      }
+        suotaCharsList = await svcSuota.getCharacteristics();
+      } catch (_) {}
+
       const suota = {
-        memDev: await svcSuota.getCharacteristic(UUID_SPOTA_MEM_DEV),
-        gpioMap: await svcSuota.getCharacteristic(UUID_SPOTA_GPIO_MAP),
-        patchLen: await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_LEN),
-        patchData: await svcSuota.getCharacteristic(UUID_SPOTA_PATCH_DATA),
-        status: await svcSuota.getCharacteristic(UUID_SPOTA_STATUS),
+        memDev: await findCharCompatible(svcSuota, suotaCharsList, UUID_SPOTA_MEM_DEV, '8082caa8'),
+        gpioMap: await findCharCompatible(svcSuota, suotaCharsList, UUID_SPOTA_GPIO_MAP, '724249f0'),
+        patchLen: await findCharCompatible(svcSuota, suotaCharsList, UUID_SPOTA_PATCH_LEN, '9d84b9a3'),
+        patchData: await findCharCompatible(svcSuota, suotaCharsList, UUID_SPOTA_PATCH_DATA, '457871e8'),
+        status: await findCharCompatible(svcSuota, suotaCharsList, UUID_SPOTA_STATUS, '5f78df94'),
         onStatus: event => onSuotaStatusNotify(current, event)
       };
       await suota.status.startNotifications();
@@ -554,30 +603,38 @@ document.getElementById('btnConnect').onclick = async () => {
       current.suota = suota;
       log('✅ 已就绪: Dialog SUOTA 无线升级服务 (0xFEF5) & 状态通知已开启', 'log-ok');
     } catch (e) {
-      log(`⚠️ 未能绑定完整 SUOTA (0xFEF5) 服务: ${e.message}`, 'log-warn');
+      log(`⚠️ 未能绑定完整 SUOTA (0xFEF5) 服务: ${e.message || e}`, 'log-warn');
     }
 
     // 2. Discover Custom 0x1F10 -> 0x1F1F
     try {
-      let svc1f10;
+      const svc1f10 = await findServiceCompatible(
+        gattServer,
+        allServices,
+        '1f10',
+        '00001f10-0000-1000-8000-00805f9b34fb',
+        UUID_SVC_CUSTOM
+      );
+      let customCharsList = [];
       try {
-        svc1f10 = await gattServer.getPrimaryService(UUID_SVC_CUSTOM);
-      } catch (_) {
-        svc1f10 = await gattServer.getPrimaryService('00001f10-0000-1000-8000-00805f9b34fb');
-      }
-      try {
-        current.control = await svc1f10.getCharacteristic(UUID_CHAR_1F1F);
-      } catch (_) {
-        current.control = await svc1f10.getCharacteristic('00001f1f-0000-1000-8000-00805f9b34fb');
-      }
+        customCharsList = await svc1f10.getCharacteristics();
+      } catch (_) {}
+
+      current.control = await findCharCompatible(
+        svc1f10,
+        customCharsList,
+        '00001f1f-0000-1000-8000-00805f9b34fb',
+        '1f1f',
+        UUID_CHAR_1F1F
+      );
       log('✅ 已就绪: 墨水屏控制特征值 0x1F1F (Write me)', 'log-ok');
     } catch (e) {
-      log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message})`, 'log-warn');
+      log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message || e})`, 'log-warn');
     }
 
     if (!device.gatt.connected) endConnection(current);
   } catch (err) {
-    log(`❌ 连接失败: ${err.message}`, 'log-err');
+    log(`❌ 连接失败: ${err.message || err}`, 'log-err');
   } finally {
     isConnecting = false;
     updateUi();
@@ -676,21 +733,29 @@ async function loadSelectedFirmware() {
 }
 
 function canWriteWithoutResponse(char) {
-  return char.properties?.writeWithoutResponse !== false && typeof char.writeValueWithoutResponse === 'function';
+  return char.properties?.writeWithoutResponse === true && typeof char.writeValueWithoutResponse === 'function';
 }
 
 async function writeCharacteristic(char, data, withResponse = true) {
-  if (!withResponse && canWriteWithoutResponse(char)) {
-    return char.writeValueWithoutResponse(data);
+  if (!withResponse && typeof char.writeValueWithoutResponse === 'function') {
+    try {
+      return await char.writeValueWithoutResponse(data);
+    } catch (_) {}
   }
-  if (char.properties?.write !== false && typeof char.writeValueWithResponse === 'function') {
-    return char.writeValueWithResponse(data);
+  if (withResponse && typeof char.writeValueWithResponse === 'function') {
+    try {
+      return await char.writeValueWithResponse(data);
+    } catch (err) {
+      if (typeof char.writeValue !== 'function') throw err;
+    }
   }
-  if (typeof char.writeValue === 'function' &&
-      (char.properties?.write !== false || (!withResponse && char.properties?.writeWithoutResponse !== false))) {
-    return char.writeValue(data);
+  if (typeof char.writeValue === 'function') {
+    return await char.writeValue(data);
   }
-  throw new Error('蓝牙特征不支持所需的写入方式');
+  if (typeof char.writeValueWithResponse === 'function') {
+    return await char.writeValueWithResponse(data);
+  }
+  throw new Error('蓝牙特征不支持写入操作');
 }
 
 document.getElementById('btnStartOta').onclick = async () => {
