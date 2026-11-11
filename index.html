@@ -201,7 +201,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#38bdf8;">v1.8 Bluefy专版</span></h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#4ade80;">v1.9 防断连专版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
@@ -239,7 +239,7 @@
     <label class="fw-option">
       <input type="radio" name="fwSource" value="diag_5s" checked />
       <div>
-        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.8，推荐)</div>
+        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.9，推荐)</div>
         <div class="fw-desc">
           已恢复为每 <b>60.0 秒</b>单次局刷 (~0.9s 刷新 + ~59.1s 静止休眠)，已修复每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>HW=1 (SSD1680)</code> 温度读取，支持 <code>0x1F1F</code> 蓝牙指令实时回显。<code>CRC32: 0xe8901b9f</code>
         </div>
@@ -267,8 +267,17 @@
       </div>
     </label>
 
+    <div style="margin-top:12px;">
+      <label>🛡️ Bluefy 防丢包传输档位 (解决 6% / 90% 擦除扇区与队列溢出断连)</label>
+      <select id="selWriteMode">
+        <option value="safe_80" selected>🛡️ 防断连稳妥模式 (80B/块 · 4包一确认 · 42ms/包 + 扇区缓冲，推荐 iPhone)</option>
+        <option value="rescue_80">🐢 极慢救援模式 (80B/块 · 4包一确认 · 65ms/包，信号弱/反复超时选此项)</option>
+        <option value="fast_160">⚡ 均衡提速模式 (160B/块 · 8包一确认 · 25ms/包)</option>
+      </select>
+    </div>
+
     <details style="margin-top:10px;">
-      <summary>⚙️ 高级 SPI Flash 引脚与传输参数 (已预填本机阿里巴巴 20190605 主板参数)</summary>
+      <summary>⚙️ 高级 SPI Flash 引脚与分区参数 (已预填本机阿里巴巴 20190605 主板参数)</summary>
       <div class="grid-4" style="margin-bottom:10px;">
         <div>
           <label>MISO (SPI_DI)</label>
@@ -287,22 +296,13 @@
           <input type="text" id="pinSck" value="0x00" readonly title="P0_0 = 0x00" />
         </div>
       </div>
-      <div class="grid-2">
-        <div>
-          <label>目标 Image Bank</label>
-          <select id="selBank">
-            <option value="0" selected>0 - 自动覆盖最旧分区 (Auto / Oldest，推荐)</option>
-            <option value="1">1 - 强制写入 Bank 1 (0x02000)</option>
-            <option value="2">2 - 强制写入 Bank 2 (0x14000)</option>
-          </select>
-        </div>
-        <div>
-          <label>BLE 写入模式</label>
-          <select id="selWriteMode">
-            <option value="withResponse" selected>稳定模式 (WriteWithResponse，兼容 iPhone Bluefy)</option>
-            <option value="withoutResponse">高速模式 (WriteWithoutResponse + 6ms 节流)</option>
-          </select>
-        </div>
+      <div>
+        <label>目标 Image Bank</label>
+        <select id="selBank">
+          <option value="0" selected>0 - 自动覆盖最旧分区 (Auto / Oldest，推荐)</option>
+          <option value="1">1 - 强制写入 Bank 1 (0x02000)</option>
+          <option value="2">2 - 强制写入 Bank 2 (0x14000)</option>
+        </select>
       </div>
     </details>
 
@@ -500,6 +500,9 @@ function endConnection(current) {
   if (current.suota) {
     current.suota.status.removeEventListener('characteristicvaluechanged', current.suota.onStatus);
   }
+  if (current.notify1f33 && current.on1f33) {
+    current.notify1f33.removeEventListener('characteristicvaluechanged', current.on1f33);
+  }
   current.statusWaiter?.finish(new Error('蓝牙设备已断开'));
   connection = null;
   log('🔌 蓝牙已断开连接');
@@ -577,8 +580,12 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
     const gattServer = await device.gatt.connect();
     const current = {
       device,
+      connectedAt: performance.now(),
       suota: null,
       control: null,
+      notify1f33: null,
+      on1f33: null,
+      busy1f33Seq: 0,
       imgCtrl: null,
       epdLocked: false,
       statusWaiter: null,
@@ -651,6 +658,26 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
         UUID_CHAR_1F1F
       );
       log('✅ 已就绪: 墨水屏控制特征值 0x1F1F (Write me)', 'log-ok');
+
+      try {
+        const ch1f33 = await findCharCompatible(
+          svc1f10,
+          customCharsList,
+          '00001f33-0000-1000-8000-00805f9b34fb',
+          '1f33',
+          0x1f33
+        );
+        await ch1f33.startNotifications();
+        current.on1f33 = ev => {
+          const dv = ev.target?.value;
+          if (dv && dv.byteLength >= 2 && dv.getUint8(0) === 0 && dv.getUint8(1) === 0) {
+            current.busy1f33Seq++;
+          }
+        };
+        ch1f33.addEventListener('characteristicvaluechanged', current.on1f33);
+        current.notify1f33 = ch1f33;
+        log('✅ 已就绪: 0x1F33 刷屏忙碌状态通知 (用于 100% 硬件验证 0x80 锁屏成功)', 'log-ok');
+      } catch (_) {}
     } catch (e) {
       log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message || e})`, 'log-warn');
     }
@@ -849,34 +876,108 @@ async function writeCharacteristic(char, data, withResponse = true) {
   throw new Error('蓝牙特征不支持写入操作');
 }
 
+async function writePatchDataChunk(char, chunk, paceMs) {
+  const buf = toStandaloneBuffer(chunk);
+  let writeErr = null;
+  const dispatch = async () => {
+    if (typeof char.writeValueWithoutResponse === 'function') {
+      try {
+        return await char.writeValueWithoutResponse(buf);
+      } catch (e) {
+        if (typeof char.writeValue !== 'function') throw e;
+      }
+    }
+    if (typeof char.writeValue === 'function') {
+      return await char.writeValue(buf);
+    }
+    if (typeof char.writeValueWithResponse === 'function') {
+      return await char.writeValueWithResponse(buf);
+    }
+    throw new Error('SPOTA_PATCH_DATA 特征不支持写入');
+  };
+  const p = dispatch().catch(err => {
+    writeErr = err;
+  });
+  await Promise.all([
+    Promise.race([p, sleep(paceMs)]),
+    sleep(paceMs)
+  ]);
+  if (writeErr) throw writeErr;
+}
+
 async function lockEpdRefreshBeforeOta(current, statStatus = null) {
-  if (!current.imgCtrl && !current.control) return;
+  if (!current.imgCtrl && !current.control) {
+    // Still wait for DA14585's 2.0s post-connect GAPC_PARAM_UPDATE_CMD to settle on iOS
+    const sinceConn = performance.now() - (current.connectedAt || 0);
+    if (sinceConn < 2600) await sleep(2600 - sinceConn);
+    return;
+  }
   const cmd80 = new Uint8Array([0x80]);
+  if (current.control) {
+    Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(120)]);
+  }
   if (current.epdLocked) {
     if (current.imgCtrl) {
       await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(200)]);
     }
+    const sinceConn = performance.now() - (current.connectedAt || 0);
+    if (sinceConn < 2600) await sleep(2600 - sinceConn);
     return;
   }
-  log('⏸️ 正在向设备持续发送 0x80 刷屏暂停锁 (约 5 秒，等待当前局刷周期结束并锁定 SPI 引脚 P0_0/P0_5/P0_6)...', 'log-info');
-  const totalSteps = 26;
-  for (let i = 0; i < totalSteps; i++) {
+
+  const hasHwVerify = !!current.notify1f33 && !!current.imgCtrl;
+  log(
+    hasHwVerify
+      ? '⏸️ 正在高频发送 0x80 刷屏暂停锁，并通过 0x1F33 硬件监听墨水屏空闲确认...'
+      : '⏸️ 正在高频发送 0x80 刷屏暂停锁 (约 6.5 秒，每 85ms 一次确保精准命中局刷间隙并释放 SPI 引脚)...',
+    'log-info'
+  );
+
+  const maxSteps = 78;
+  let quietStreak = 0;
+  for (let i = 0; i < maxSteps; i++) {
     checkConnected(current);
-    const remSec = (((totalSteps - i) * 0.19)).toFixed(1);
+    const seqBefore = current.busy1f33Seq;
+    const remSec = (((maxSteps - i) * 0.09)).toFixed(1);
     if (statStatus) {
-      statStatus.textContent = `⏸️ 正在锁定墨水屏刷新以释放 SPI 引脚 (剩余 ${remSec}s)...`;
+      statStatus.textContent = hasHwVerify
+        ? `⏸️ 正在等待当前墨水屏局刷结束并锁定 SPI 引脚 (确认进度 ${Math.min(quietStreak, 6)}/6, 最长 ${remSec}s)...`
+        : `⏸️ 正在高频锁定墨水屏刷新以释放 SPI 引脚 (剩余 ${remSec}s)...`;
     }
+
     if (current.imgCtrl) {
-      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(180)]);
+      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(140)]);
     } else if (current.control) {
-      await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(180)]);
+      await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(100)]);
     }
-    await sleep(160);
+    await sleep(85);
+
+    if (hasHwVerify) {
+      if (current.busy1f33Seq > seqBefore) {
+        quietStreak = 0;
+      } else {
+        quietStreak++;
+        const sinceConn = performance.now() - (current.connectedAt || 0);
+        // Require >=6 consecutive quiet 0x80 writes (~1.0s confirmed idle) AND >=2.6s since BLE connect (connection params settled)
+        if (quietStreak >= 6 && sinceConn >= 2600) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (current.control) {
+    await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(120)]);
   }
   current.epdLocked = true;
-  log('✅ 墨水屏刷新已暂停并锁定 (*0x07fcef74 = 1)，SPI Flash 引脚已释放！', 'log-ok');
+  log(
+    hasHwVerify && quietStreak >= 6
+      ? '✅ 0x1F33 硬件确认墨水屏已静止并锁定 (*0x07fcef74 = 1)，SPI Flash 引脚已安全独占！'
+      : '✅ 墨水屏刷新暂停锁发送完成 (*0x07fcef74 = 1)，SPI Flash 引脚已释放！',
+    'log-ok'
+  );
   if (statStatus) {
-    statStatus.textContent = '✅ 墨水屏已暂停，准备刷机';
+    statStatus.textContent = '✅ 墨水屏已锁定静止，准备刷机';
   }
 }
 
@@ -896,17 +997,41 @@ document.getElementById('btnPauseRefresh').onclick = async () => {
   }
 };
 
+const WRITE_MODE_PROFILES = {
+  safe_80: {
+    label: '防断连稳妥模式',
+    blockSize: 80,
+    chunkPaceMs: 42,
+    sectorPauseMs: 160
+  },
+  rescue_80: {
+    label: '极慢救援模式',
+    blockSize: 80,
+    chunkPaceMs: 65,
+    sectorPauseMs: 240
+  },
+  fast_160: {
+    label: '均衡提速模式',
+    blockSize: 160,
+    chunkPaceMs: 25,
+    sectorPauseMs: 100
+  }
+};
+
 document.getElementById('btnStartOta').onclick = async () => {
   const current = connection;
   if (isConnecting || isOtaRunning || isControlWriting || !current?.suota || !current.device.gatt.connected) return;
   const {suota} = current;
   const bank = parseInt(document.getElementById('selBank').value, 10);
-  const fastMode = document.getElementById('selWriteMode').value === 'withoutResponse';
-  const useWithResponse = !fastMode || !canWriteWithoutResponse(suota.patchData);
+  const modeKey = document.getElementById('selWriteMode').value;
+  const profile = WRITE_MODE_PROFILES[modeKey] || WRITE_MODE_PROFILES.safe_80;
   const progressBar = document.getElementById('progressBar');
   const statStatus = document.getElementById('statStatus');
   const statProgress = document.getElementById('statProgress');
   let startRequested = false;
+  let offset = 0;
+  let totalLen = 0;
+  let blockIdx = 0;
 
   isOtaRunning = true;
   updateUi();
@@ -916,12 +1041,9 @@ document.getElementById('btnStartOta').onclick = async () => {
 
   try {
     const payload = await loadSelectedFirmware();
-    const totalLen = payload.length;
+    totalLen = payload.length;
     checkConnected(current);
     statProgress.textContent = `0 / ${totalLen} B (0%)`;
-    if (fastMode && useWithResponse) {
-      log('⚠️ 当前连接不支持高速写入，改用带响应写入。', 'log-warn');
-    }
 
     // Step 0: Lock E-Ink refresh so the display never hijacks P0_0/P0_5/P0_6 during SPI Flash writes
     await lockEpdRefreshBeforeOta(current, statStatus);
@@ -930,9 +1052,9 @@ document.getElementById('btnStartOta').onclick = async () => {
     const memDevCmd = new Uint8Array([bank, 0x00, 0x00, 0x13]);
     log(`1️⃣ 发送 SPOTA_MEM_DEV = 0x1300000${bank} (External SPI Flash, Bank=${bank})...`);
     statStatus.textContent = '正在初始化外部 SPI Flash...';
-    await writeAndWaitForStatus(current, 0x10, 4000, 'SUOTA 初始化', () => {
+    await writeAndWaitForStatus(current, 0x10, 6000, 'SUOTA 初始化', () => {
       startRequested = true;
-      return writeCharacteristic(suota.memDev, memDevCmd);
+      return writeCharacteristic(suota.memDev, memDevCmd, true);
     });
     log('✅ 设备已进入 IMG_STARTED (0x10) 状态', 'log-ok');
 
@@ -940,58 +1062,61 @@ document.getElementById('btnStartOta').onclick = async () => {
     const gpioMapCmd = new Uint8Array([0x00, 0x03, 0x06, 0x05]);
     log('2️⃣ 发送 SPOTA_GPIO_MAP = 0x05060300 (MISO=P0_5, MOSI=P0_6, CS=P0_3, SCK=P0_0)...');
     checkConnected(current);
-    await writeCharacteristic(suota.gpioMap, gpioMapCmd);
+    await writeCharacteristic(suota.gpioMap, gpioMapCmd, true);
+    await sleep(60);
 
-    // Step 3: Stream blocks (BLOCK_SIZE = 240 bytes, CHUNK_SIZE = 20 bytes)
-    const BLOCK_SIZE = 240;
+    // Step 3: Stream small hardware-confirmed blocks so iOS CoreBluetooth never overflows its WriteWithoutResponse queue
+    let BLOCK_SIZE = profile.blockSize;
+    if ((totalLen - 1) % BLOCK_SIZE === 0) {
+      BLOCK_SIZE += 20;
+    }
     const CHUNK_SIZE = 20;
-    let offset = 0;
     let currentPatchLen = 0;
-    let blockIdx = 0;
-    let bluefyNoAckMode = false;
+    const totalBlocks = Math.ceil(totalLen / BLOCK_SIZE);
     const startTime = performance.now();
 
-    log(`3️⃣ 开始分块传输 (每块 ${BLOCK_SIZE}B，每包 ${CHUNK_SIZE}B，共 ${Math.ceil(totalLen / BLOCK_SIZE)} 块)...`, 'log-info');
+    log(
+      `3️⃣ 开始 [${profile.label}] 分块传输 (每块 ${BLOCK_SIZE}B = ${BLOCK_SIZE / CHUNK_SIZE}包一硬件确认, 间隔 ${profile.chunkPaceMs}ms, 共 ${totalBlocks} 块)...`,
+      'log-info'
+    );
 
     while (offset < totalLen) {
       const rem = totalLen - offset;
       const blockLen = Math.min(BLOCK_SIZE, rem);
+      const crosses4kSector =
+        offset === 0 ||
+        (offset & 0xfff) === 0 ||
+        (offset >> 12) !== ((offset + blockLen) >> 12);
+      const blockTimeoutMs = crosses4kSector ? 16000 : 12000;
 
-      await writeAndWaitForStatus(current, 0x02, blockIdx === 0 ? 12000 : 8000, `第 ${blockIdx + 1} 块写入`, async check => {
-        if (blockLen !== currentPatchLen) {
-          const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
-          await writeCharacteristic(suota.patchLen, patchLenBytes);
-          currentPatchLen = blockLen;
-          log(`   设置 SPOTA_PATCH_LEN = ${blockLen} Bytes`);
-        }
+      await writeAndWaitForStatus(
+        current,
+        0x02,
+        blockTimeoutMs,
+        `第 ${blockIdx + 1}/${totalBlocks} 块 (偏移 ${offset}B, ${((offset / totalLen) * 100).toFixed(1)}%)`,
+        async check => {
+          if (blockLen !== currentPatchLen) {
+            const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
+            await writeCharacteristic(suota.patchLen, patchLenBytes, true);
+            currentPatchLen = blockLen;
+            log(`   设置 SPOTA_PATCH_LEN = ${blockLen} Bytes`);
+            await sleep(40);
+          }
 
-        for (let c = 0; c < blockLen; c += CHUNK_SIZE) {
-          check();
-          const chunkEnd = Math.min(c + CHUNK_SIZE, blockLen);
-          // MUST use .slice() (standalone 20B ArrayBuffer), NOT .subarray() (which shares the 61,321B buffer in Bluefy!)
-          const chunk = payload.slice(offset + c, offset + chunkEnd);
-
-          if (bluefyNoAckMode) {
-            writeCharacteristic(suota.patchData, chunk, false).catch(() => {});
-            await sleep(16);
-          } else if (blockIdx === 0 && c === 0) {
-            // Probe on the very first chunk: if Bluefy uses CoreBluetooth .withoutResponse on SPOTA_PATCH_DATA,
-            // didWriteValueFor is never called by iOS so the Promise never resolves.
-            let resolvedInTime = false;
-            const pWrite = writeCharacteristic(suota.patchData, chunk, useWithResponse).then(() => {
-              resolvedInTime = true;
-            });
-            await Promise.race([pWrite, sleep(250)]);
-            if (!resolvedInTime) {
-              bluefyNoAckMode = true;
-              log('ℹ️ 检测到 iOS Bluefy 无回调写入特征 (WriteWithoutResponse)，自动启用 16ms 节流 + 块级 0x02 硬件确认模式', 'log-info');
-            }
-          } else {
-            await writeCharacteristic(suota.patchData, chunk, useWithResponse);
-            if (!useWithResponse) await sleep(6);
+          for (let c = 0; c < blockLen; c += CHUNK_SIZE) {
+            check();
+            const chunkEnd = Math.min(c + CHUNK_SIZE, blockLen);
+            // MUST use .slice() (standalone 20B ArrayBuffer), NOT .subarray()!
+            const chunk = payload.slice(offset + c, offset + chunkEnd);
+            await writePatchDataChunk(suota.patchData, chunk, profile.chunkPaceMs);
           }
         }
-      });
+      );
+
+      // Give DA14585 BLE radio + iOS CoreBluetooth TX window a clean breather right after any 4KB SPI sector erase!
+      if (crosses4kSector) {
+        await sleep(profile.sectorPauseMs);
+      }
 
       offset += blockLen;
       blockIdx++;
@@ -1000,19 +1125,19 @@ document.getElementById('btnStartOta').onclick = async () => {
       const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
       const speedKBs = ((offset / 1024) / elapsedSec).toFixed(2);
       progressBar.style.width = `${pct}%`;
-      statStatus.textContent = `正在写入区块 #${blockIdx} (${speedKBs} KB/s)`;
+      statStatus.textContent = `正在写入区块 #${blockIdx}/${totalBlocks} (${speedKBs} KB/s)`;
       statProgress.textContent = `${offset} / ${totalLen} B (${pct}%)`;
 
-      if (blockIdx === 1 || blockIdx % 25 === 0 || offset === totalLen) {
-        log(`   ✓ 区块 #${blockIdx} 完成 (${offset}/${totalLen} B, ${pct}%, ${speedKBs} KB/s)`);
+      if (blockIdx === 1 || blockIdx % 50 === 0 || offset === totalLen) {
+        log(`   ✓ 区块 #${blockIdx}/${totalBlocks} 完成 (${offset}/${totalLen} B, ${pct}%, ${speedKBs} KB/s)`);
       }
     }
 
     // Step 4: Send SUOTA_IMG_END (0xFE000000) to verify full-image XOR == 0 and write 0xAA valid flag
     log('4️⃣ 发送结束校验指令 SPOTA_MEM_DEV = 0xFE000000...');
     statStatus.textContent = '正在校验整包 XOR 并激活新分区...';
-    await writeAndWaitForStatus(current, 0x02, 6000, '整包校验', () =>
-      writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFE]))
+    await writeAndWaitForStatus(current, 0x02, 8000, '整包校验', () =>
+      writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFE]), true)
     );
     log('🎉 整包 XOR 校验通过！SPI Flash 新分区已标记为 0xAA 有效！', 'log-ok');
 
@@ -1020,7 +1145,7 @@ document.getElementById('btnStartOta').onclick = async () => {
     statStatus.textContent = '固件已写入，正在请求设备重启...';
     try {
       checkConnected(current);
-      await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]));
+      await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]), true);
       if (connection === current) disconnect(current);
     } catch (err) {
       statStatus.textContent = '固件已写入，重启未确认';
@@ -1028,19 +1153,22 @@ document.getElementById('btnStartOta').onclick = async () => {
       return;
     }
     statStatus.textContent = '固件已写入，重启指令已确认';
-    log('✅ 重启指令已确认，请观察屏幕并重新连接以确认新固件已启动。', 'log-ok');
+    log('✅ 重启指令已确认，设备即将以 60 秒单次局刷固件启动！', 'log-ok');
   } catch (err) {
     const errMsg = formatErr(err);
-    log(`❌ OTA 升级中断: ${errMsg}`, 'log-err');
-    statStatus.textContent = `❌ 失败: ${errMsg}`;
+    const pctAtErr = totalLen > 0 ? ((offset / totalLen) * 100).toFixed(1) : '0.0';
+    log(`❌ OTA 升级中断 (停在 ${pctAtErr}%, 区块 #${blockIdx + 1}, ${offset}/${totalLen}B): ${errMsg}`, 'log-err');
+    statStatus.textContent = `❌ 失败 (${pctAtErr}%): ${errMsg}`;
     if (startRequested && connection === current && current.device.gatt.connected) {
       try {
-        await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]));
+        // Send SPOTAR_IMG_EXIT (0xFF000000) to reset DA14585 suota_state WITHOUT disconnecting Bluetooth or losing 0x80 screen lock!
+        await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]), true);
+        await sleep(350);
+        log('ℹ️ 已复位设备 SUOTA 状态并保持蓝牙连接与锁屏状态，可直接切换「极慢救援模式」重试！', 'log-info');
       } catch (exitError) {
         log(`⚠️ 无法发送 SUOTA 退出指令: ${formatErr(exitError)}`, 'log-warn');
+        if (connection === current) disconnect(current);
       }
-      // A fresh connection keeps delayed notifications from this transfer out of a retry.
-      if (connection === current) disconnect(current);
     }
   } finally {
     isOtaRunning = false;
