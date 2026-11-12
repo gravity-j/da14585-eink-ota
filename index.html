@@ -204,7 +204,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#4ade80;">v1.10 防断连修正版</span></h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#4ade80;">v1.11 固件修正版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
@@ -242,9 +242,9 @@
     <label class="fw-option">
       <input type="radio" name="fwSource" value="diag_5s" checked />
       <div>
-        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.10，推荐)</div>
+        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.11，推荐)</div>
         <div class="fw-desc">
-          已恢复为每 <b>60.0 秒</b>单次局刷 (~0.9s 刷新 + ~59.1s 静止休眠)，已修复每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>HW=1 (SSD1680)</code> 温度读取，支持 <code>0x1F1F</code> 蓝牙指令实时回显。<code>CRC32: 0xe8901b9f</code>
+          已恢复为每 <b>60.0 秒</b>单次局刷 (~0.9s 刷新 + ~59.1s 静止休眠)，已修复每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>HW=1 (SSD1680)</code> 温度读取，支持 <code>0x1F1F</code> 蓝牙指令实时回显。锁屏期间 <code>0x1F1F</code> 指令不再触发刷新，每天 00:00 自动全刷一次清残影。<code>CRC32: 0x91cb09cc</code>
         </div>
       </div>
     </label>
