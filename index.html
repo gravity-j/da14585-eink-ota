@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>DA14585 墨水屏 Web Bluetooth OTA 刷机与控制台</title>
@@ -201,7 +204,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#4ade80;">v1.9 防断连专版</span></h1>
+    <h1>⚡ DA14585 墨水屏 OTA 刷机台 <span class="badge" style="color:#4ade80;">v1.10 防断连修正版</span></h1>
     <span id="connBadge" class="badge">未连接设备</span>
   </header>
 
@@ -239,7 +242,7 @@
     <label class="fw-option">
       <input type="radio" name="fwSource" value="diag_5s" checked />
       <div>
-        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.9，推荐)</div>
+        <div class="fw-title">🚀 硬件诊断 + 60秒单次局刷固件 (V1.57-Diag-60s v1.10，推荐)</div>
         <div class="fw-desc">
           已恢复为每 <b>60.0 秒</b>单次局刷 (~0.9s 刷新 + ~59.1s 静止休眠)，已修复每次局刷连刷 3 遍 (<code>cmp r1, #3 -> #1</code>)、1.5s 按键轮询误触发及 <code>HW=1 (SSD1680)</code> 温度读取，支持 <code>0x1F1F</code> 蓝牙指令实时回显。<code>CRC32: 0xe8901b9f</code>
         </div>
@@ -399,6 +402,15 @@ document.getElementById('btnClearLog').onclick = () => { logBox.innerHTML = ''; 
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Bluefy sometimes never settles a GATT write promise: always bound it so the UI can't hang forever
+function withTimeout(promise, ms, msg) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { t = setTimeout(() => reject(new Error(msg)), ms); })
+  ]).finally(() => clearTimeout(t));
+}
+
 function checkConnected(current) {
   if (connection !== current || !current.device.gatt.connected) {
     throw new Error('蓝牙设备已断开');
@@ -419,6 +431,8 @@ async function writeAndWaitForStatus(current, expected, timeoutMs, step, send) {
   });
   current.statusWaiter = {
     notify(code) {
+      // Late 0x02/0x03 from a previous aborted attempt must not fail a fresh MEM_DEV (expects 0x10)
+      if (expected === 0x10 && (code === 0x02 || code === 0x03)) return;
       const desc = SUOTA_STATUS_TEXT[code] || `未知状态 0x${code.toString(16)}`;
       finish(code === expected ? null : new Error(`${step}失败: ${desc}`));
     },
@@ -432,12 +446,13 @@ async function writeAndWaitForStatus(current, expected, timeoutMs, step, send) {
   let timer;
   try {
     check();
-    await send(check);
-    if (!received) {
-      timer = setTimeout(() => {
-        finish(new Error(`${step}超时: 未收到 SUOTA 状态 0x${expected.toString(16)}`));
-      }, timeoutMs);
-    }
+    // Timer starts BEFORE sending: a never-settling Bluefy write can no longer freeze the OTA
+    timer = setTimeout(() => {
+      finish(new Error(`${step}超时: 未收到 SUOTA 状态 0x${expected.toString(16)}`));
+    }, timeoutMs);
+    Promise.resolve()
+      .then(() => send(check))
+      .catch(err => finish(err));
     const error = await status;
     if (error) throw error;
   } finally {
@@ -484,7 +499,7 @@ function updateUi() {
     if (el) el.disabled = busy || connected;
   }
   document.getElementById('btnDisconnect').disabled = busy || !connected;
-  document.getElementById('btnPauseRefresh').disabled = busy || !connected || (!connection.imgCtrl && !connection.control);
+  document.getElementById('btnPauseRefresh').disabled = busy || !connected || !connection.imgCtrl;
   document.getElementById('btnStartOta').disabled = busy || !connected || !connection.suota;
   for (const id of ['btnSendAuth', 'btnSyncTime', 'btnModeClock', 'btnFullRefresh', 'btnSendHex']) {
     document.getElementById(id).disabled = busy || !connected || !connection.control;
@@ -500,8 +515,8 @@ function endConnection(current) {
   if (current.suota) {
     current.suota.status.removeEventListener('characteristicvaluechanged', current.suota.onStatus);
   }
-  if (current.notify1f33 && current.on1f33) {
-    current.notify1f33.removeEventListener('characteristicvaluechanged', current.on1f33);
+  if (current.imgCtrl && current.onImgNotify) {
+    current.imgCtrl.removeEventListener('characteristicvaluechanged', current.onImgNotify);
   }
   current.statusWaiter?.finish(new Error('蓝牙设备已断开'));
   connection = null;
@@ -583,10 +598,10 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
       connectedAt: performance.now(),
       suota: null,
       control: null,
-      notify1f33: null,
-      on1f33: null,
-      busy1f33Seq: 0,
       imgCtrl: null,
+      onImgNotify: null,
+      imgNotifyOk: false,
+      busySeq: 0,
       epdLocked: false,
       statusWaiter: null,
       onDisconnect() {
@@ -659,25 +674,6 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
       );
       log('✅ 已就绪: 墨水屏控制特征值 0x1F1F (Write me)', 'log-ok');
 
-      try {
-        const ch1f33 = await findCharCompatible(
-          svc1f10,
-          customCharsList,
-          '00001f33-0000-1000-8000-00805f9b34fb',
-          '1f33',
-          0x1f33
-        );
-        await ch1f33.startNotifications();
-        current.on1f33 = ev => {
-          const dv = ev.target?.value;
-          if (dv && dv.byteLength >= 2 && dv.getUint8(0) === 0 && dv.getUint8(1) === 0) {
-            current.busy1f33Seq++;
-          }
-        };
-        ch1f33.addEventListener('characteristicvaluechanged', current.on1f33);
-        current.notify1f33 = ch1f33;
-        log('✅ 已就绪: 0x1F33 刷屏忙碌状态通知 (用于 100% 硬件验证 0x80 锁屏成功)', 'log-ok');
-      } catch (_) {}
     } catch (e) {
       log(`ℹ️ 未发现 0x1F1F 控制特征 (${e.message || e})`, 'log-warn');
     }
@@ -701,6 +697,20 @@ async function startBleScanAndConnect(reqOpts, modeDesc) {
           '4b646063'
         );
         log('✅ 已就绪: 刷屏锁特征值 4b646063 (支持发送 0x80 暂停墨水屏刷新)', 'log-ok');
+        if (current.imgCtrl.properties?.notify) {
+          try {
+            current.onImgNotify = ev => {
+              const dv = ev.target?.value;
+              if (dv && dv.byteLength >= 2 && dv.getUint8(0) === 0 && dv.getUint8(1) === 0) current.busySeq++;
+            };
+            current.imgCtrl.addEventListener('characteristicvaluechanged', current.onImgNotify);
+            await withTimeout(current.imgCtrl.startNotifications(), 4000, '4b646063 通知开启超时');
+            current.imgNotifyOk = true;
+            log('✅ 4b646063 忙碌通知已开启 (可硬件确认 0x80 锁屏是否生效)', 'log-ok');
+          } catch (e) {
+            log(`ℹ️ 4b646063 通知不可用，改用固定时长锁屏 (${formatErr(e)})`, 'log-warn');
+          }
+        }
       }
     } catch (e) {
       log(`ℹ️ 未发现 4b646063 刷屏锁特征 (${e.message || e})`, 'log-warn');
@@ -905,80 +915,85 @@ async function writePatchDataChunk(char, chunk, paceMs) {
   if (writeErr) throw writeErr;
 }
 
+async function waitConnSettle(current) {
+  // DA14585 sends GAPC_PARAM_UPDATE_CMD 2.0s after connect; let it settle on iOS before heavy traffic
+  const sinceConn = performance.now() - (current.connectedAt || 0);
+  if (sinceConn < 2600) await sleep(2600 - sinceConn);
+}
+
+// NOTE: never write 0x80 to 0x1F1F here! On the firmware currently on the tag, ANY 0x1F1F write
+// calls render_screen_main() + epd_refresh_state_machine() => starts a refresh => hijacks SPI pins.
+// The lock is only 0x80 on 4b646063: firmware ignores it while busy (and notifies [00 00] on
+// 4b646063), and sets *0x07fcef74 = 1 when idle, after which timer_1s never starts a new refresh.
 async function lockEpdRefreshBeforeOta(current, statStatus = null) {
-  if (!current.imgCtrl && !current.control) {
-    // Still wait for DA14585's 2.0s post-connect GAPC_PARAM_UPDATE_CMD to settle on iOS
-    const sinceConn = performance.now() - (current.connectedAt || 0);
-    if (sinceConn < 2600) await sleep(2600 - sinceConn);
+  if (!current.imgCtrl) {
+    log('⚠️ 未发现 4b646063 刷屏锁特征，无法暂停墨水屏刷新 (刷机可能因 SPI 引脚冲突中断)', 'log-warn');
+    await waitConnSettle(current);
     return;
   }
   const cmd80 = new Uint8Array([0x80]);
-  if (current.control) {
-    Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(120)]);
-  }
+  const sendLock = () =>
+    withTimeout(writeCharacteristic(current.imgCtrl, cmd80, true), 1500, '0x80 写入超时').catch(() => {});
+
   if (current.epdLocked) {
-    if (current.imgCtrl) {
-      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(200)]);
-    }
-    const sinceConn = performance.now() - (current.connectedAt || 0);
-    if (sinceConn < 2600) await sleep(2600 - sinceConn);
+    checkConnected(current);
+    await sendLock();
+    await waitConnSettle(current);
     return;
   }
 
-  const hasHwVerify = !!current.notify1f33 && !!current.imgCtrl;
+  const hwVerify = current.imgNotifyOk;
   log(
-    hasHwVerify
-      ? '⏸️ 正在高频发送 0x80 刷屏暂停锁，并通过 0x1F33 硬件监听墨水屏空闲确认...'
-      : '⏸️ 正在高频发送 0x80 刷屏暂停锁 (约 6.5 秒，每 85ms 一次确保精准命中局刷间隙并释放 SPI 引脚)...',
+    hwVerify
+      ? '⏸️ 正在发送 0x80 刷屏暂停锁，并监听 4b646063 忙碌通知确认墨水屏已空闲...'
+      : '⏸️ 正在连续发送 0x80 刷屏暂停锁 (固定约 7 秒，确保命中墨水屏刷新间隙)...',
     'log-info'
   );
 
-  const maxSteps = 78;
-  let quietStreak = 0;
-  for (let i = 0; i < maxSteps; i++) {
+  const FIXED_MS = 7000;   // > one full 5s refresh cycle of the old firmware
+  const MAX_MS = 15000;    // hw-verify upper bound
+  const t0 = performance.now();
+  let quiet = 0;
+  let confirmed = false;
+  while (true) {
     checkConnected(current);
-    const seqBefore = current.busy1f33Seq;
-    const remSec = (((maxSteps - i) * 0.09)).toFixed(1);
-    if (statStatus) {
-      statStatus.textContent = hasHwVerify
-        ? `⏸️ 正在等待当前墨水屏局刷结束并锁定 SPI 引脚 (确认进度 ${Math.min(quietStreak, 6)}/6, 最长 ${remSec}s)...`
-        : `⏸️ 正在高频锁定墨水屏刷新以释放 SPI 引脚 (剩余 ${remSec}s)...`;
-    }
+    const elapsed = performance.now() - t0;
+    if (!hwVerify && elapsed >= FIXED_MS) break;
+    if (hwVerify && elapsed >= MAX_MS) break;
 
-    if (current.imgCtrl) {
-      await Promise.race([writeCharacteristic(current.imgCtrl, cmd80, true).catch(() => {}), sleep(140)]);
-    } else if (current.control) {
-      await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(100)]);
-    }
-    await sleep(85);
+    const seqBefore = current.busySeq;
+    await sendLock();
+    await sleep(hwVerify ? 300 : 100);   // leave time for a [00 00] busy notification to arrive
 
-    if (hasHwVerify) {
-      if (current.busy1f33Seq > seqBefore) {
-        quietStreak = 0;
-      } else {
-        quietStreak++;
-        const sinceConn = performance.now() - (current.connectedAt || 0);
-        // Require >=6 consecutive quiet 0x80 writes (~1.0s confirmed idle) AND >=2.6s since BLE connect (connection params settled)
-        if (quietStreak >= 6 && sinceConn >= 2600) {
-          break;
-        }
+    if (hwVerify) {
+      if (current.busySeq > seqBefore) {
+        quiet = 0;
+      } else if (++quiet >= 3 && performance.now() - (current.connectedAt || 0) >= 2600) {
+        confirmed = true;
+        break;
       }
     }
+    if (statStatus) {
+      const left = Math.max(0, ((hwVerify ? MAX_MS : FIXED_MS) - (performance.now() - t0)) / 1000).toFixed(1);
+      statStatus.textContent = hwVerify
+        ? `⏸️ 等待墨水屏空闲并锁定 (确认 ${quiet}/3，最长剩 ${left}s)...`
+        : `⏸️ 正在锁定墨水屏刷新以释放 SPI 引脚 (剩余 ${left}s)...`;
+    }
   }
+  await waitConnSettle(current);
 
-  if (current.control) {
-    await Promise.race([writeCharacteristic(current.control, cmd80, false).catch(() => {}), sleep(120)]);
+  if (hwVerify && !confirmed) {
+    log('⚠️ 15 秒内墨水屏一直忙碌，0x80 锁可能未生效；若刷机中断请稍后重试', 'log-warn');
+  } else {
+    log(
+      confirmed
+        ? '✅ 硬件确认: 0x80 已在墨水屏空闲时生效 (*0x07fcef74 = 1)，SPI Flash 引脚已安全独占！'
+        : '✅ 0x80 刷屏暂停锁已连续发送完毕 (*0x07fcef74 = 1)，SPI Flash 引脚已释放！',
+      'log-ok'
+    );
   }
   current.epdLocked = true;
-  log(
-    hasHwVerify && quietStreak >= 6
-      ? '✅ 0x1F33 硬件确认墨水屏已静止并锁定 (*0x07fcef74 = 1)，SPI Flash 引脚已安全独占！'
-      : '✅ 墨水屏刷新暂停锁发送完成 (*0x07fcef74 = 1)，SPI Flash 引脚已释放！',
-    'log-ok'
-  );
-  if (statStatus) {
-    statStatus.textContent = '✅ 墨水屏已锁定静止，准备刷机';
-  }
+  if (statStatus) statStatus.textContent = '✅ 墨水屏已锁定静止，准备刷机';
 }
 
 document.getElementById('btnPauseRefresh').onclick = async () => {
@@ -1062,7 +1077,7 @@ document.getElementById('btnStartOta').onclick = async () => {
     const gpioMapCmd = new Uint8Array([0x00, 0x03, 0x06, 0x05]);
     log('2️⃣ 发送 SPOTA_GPIO_MAP = 0x05060300 (MISO=P0_5, MOSI=P0_6, CS=P0_3, SCK=P0_0)...');
     checkConnected(current);
-    await writeCharacteristic(suota.gpioMap, gpioMapCmd, true);
+    await withTimeout(writeCharacteristic(suota.gpioMap, gpioMapCmd, true), 5000, 'SPOTA_GPIO_MAP 写入超时');
     await sleep(60);
 
     // Step 3: Stream small hardware-confirmed blocks so iOS CoreBluetooth never overflows its WriteWithoutResponse queue
@@ -1097,7 +1112,7 @@ document.getElementById('btnStartOta').onclick = async () => {
         async check => {
           if (blockLen !== currentPatchLen) {
             const patchLenBytes = new Uint8Array([blockLen & 0xff, (blockLen >> 8) & 0xff]);
-            await writeCharacteristic(suota.patchLen, patchLenBytes, true);
+            await withTimeout(writeCharacteristic(suota.patchLen, patchLenBytes, true), 5000, 'SPOTA_PATCH_LEN 写入超时');
             currentPatchLen = blockLen;
             log(`   设置 SPOTA_PATCH_LEN = ${blockLen} Bytes`);
             await sleep(40);
@@ -1145,7 +1160,7 @@ document.getElementById('btnStartOta').onclick = async () => {
     statStatus.textContent = '固件已写入，正在请求设备重启...';
     try {
       checkConnected(current);
-      await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]), true);
+      await withTimeout(writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFD]), true), 4000, '重启指令未应答');
       if (connection === current) disconnect(current);
     } catch (err) {
       statStatus.textContent = '固件已写入，重启未确认';
@@ -1162,7 +1177,7 @@ document.getElementById('btnStartOta').onclick = async () => {
     if (startRequested && connection === current && current.device.gatt.connected) {
       try {
         // Send SPOTAR_IMG_EXIT (0xFF000000) to reset DA14585 suota_state WITHOUT disconnecting Bluetooth or losing 0x80 screen lock!
-        await writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]), true);
+        await withTimeout(writeCharacteristic(suota.memDev, new Uint8Array([0x00, 0x00, 0x00, 0xFF]), true), 4000, 'SUOTA 退出指令未应答');
         await sleep(350);
         log('ℹ️ 已复位设备 SUOTA 状态并保持蓝牙连接与锁屏状态，可直接切换「极慢救援模式」重试！', 'log-info');
       } catch (exitError) {
